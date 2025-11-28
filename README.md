@@ -1,6 +1,8 @@
-# Forex ML Models for SQL Server
+# Forex ML Predictions
 
 A comprehensive machine learning system for forex trading signal prediction using technical indicators stored in SQL Server database.
+
+🔗 **Repository**: https://github.com/amirineni111/forex_ml_predictions
 
 ## Features
 
