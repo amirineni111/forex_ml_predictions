@@ -1,0 +1,47 @@
+# Python Dependencies for Forex ML Project
+
+# Database connectivity
+pyodbc>=4.0.35
+SQLAlchemy>=2.0.0
+python-dotenv>=1.0.0
+
+# Data manipulation and analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+scikit-learn>=1.3.0
+xgboost>=1.7.0
+lightgbm>=4.0.0
+
+# Technical indicators (if needed for custom calculations)
+TA-Lib>=0.4.25
+pandas-ta>=0.3.14b
+
+# Data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+
+# Jupyter notebook support
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# Data quality and profiling
+ydata-profiling>=4.6.0
+
+# Advanced ML libraries (optional)
+# tensorflow>=2.13.0
+# torch>=2.0.0
+
+# Utility libraries
+joblib>=1.3.0
+tqdm>=4.65.0
+colorama>=0.4.6
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Automation scheduling
+schedule>=1.2.0
