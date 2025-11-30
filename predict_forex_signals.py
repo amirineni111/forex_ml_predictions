@@ -273,10 +273,9 @@ class ForexTradingSignalPredictor:
             # Save model performance to database
             self.results_exporter.export_model_performance(
                 model_results=results,
-                currency_pair=currency_pair or 'ALL',
-                signal_type=signal_type,
-                training_samples=len(X),
-                features_count=len(available_features)
+                model_name=f'forex_ml_model_{currency_pair or "ALL"}',
+                training_pairs=[currency_pair] if currency_pair else ['ALL'],
+                training_date=datetime.now()
             )
             
             # Save the model
@@ -293,7 +292,7 @@ class ForexTradingSignalPredictor:
             return False
     
     def predict_signals(self, df=None, currency_pair=None):
-        """Generate forex trading signals"""
+        """Generate forex trading signals for next trading day"""
         
         if self.model_manager is None or self.model_manager.best_model is None:
             safe_print("❌ No trained model available. Training new model...")
@@ -311,7 +310,7 @@ class ForexTradingSignalPredictor:
         
         # Get recent data for prediction if not provided
         if df is None:
-            df = self.get_forex_data(currency_pair=currency_pair, days_back=30)
+            df = self.get_forex_data(currency_pair=currency_pair, days_back=100)  # Get enough history for features
         
         if df.empty:
             safe_print("❌ No data available for prediction")
@@ -327,14 +326,17 @@ class ForexTradingSignalPredictor:
                 safe_print("❌ Insufficient features for prediction")
                 return pd.DataFrame()
             
-            # Get most recent data for prediction
-            df_recent = df_features.dropna(subset=available_features).tail(50)
+            # Get the MOST RECENT record only (latest trading day)
+            df_features = df_features.sort_values('date_time')
+            df_recent = df_features.dropna(subset=available_features).tail(1)  # Only predict for latest day
             
             if df_recent.empty:
                 safe_print("❌ No valid data for prediction")
                 return pd.DataFrame()
             
-            # Make predictions
+            safe_print(f"📊 Predicting for latest date: {df_recent['date_time'].iloc[0]}")
+            
+            # Make prediction for next trading day
             X_pred = df_recent[available_features].fillna(0)
             predictions = self.model_manager.predict(X_pred)
             

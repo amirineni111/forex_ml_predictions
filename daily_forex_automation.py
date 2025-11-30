@@ -7,6 +7,7 @@ Automates daily forex signal generation, model training, and reporting.
 import os
 import sys
 import logging
+import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 import schedule
@@ -203,15 +204,16 @@ class ForexDailyAutomation:
                         currency_pair=pair
                     )
                     
-                    # Generate predictions
-                    predictions = predictor.predict_signals(currency_pair=pair)
+                    # Generate FORWARD-LOOKING prediction for next trading day
+                    from src.utils.forward_prediction import predict_next_day_signals
+                    predictions = predict_next_day_signals(predictor, pair)
                     
                     if not predictions.empty:
                         predictions['processed_date'] = datetime.now()
                         all_predictions.append(predictions)
-                        safe_print(f"✅ Generated {len(predictions)} signals for {pair}")
+                        safe_print(f"✅ Generated NEXT DAY signal for {pair}: {predictions['predicted_signal'].iloc[0]}")
                     else:
-                        safe_print(f"⚠️ No predictions generated for {pair}")
+                        safe_print(f"⚠️ No prediction generated for {pair}")
                         
                 except Exception as e:
                     safe_print(f"❌ Error processing {pair}: {e}")
@@ -295,42 +297,85 @@ class ForexDailyAutomation:
             safe_print(f"❌ Error generating summary: {e}")
     
     def retrain_models_weekly(self):
-        """Retrain models weekly with fresh data."""
-        safe_print("🔄 Starting weekly model retraining...")
+        """Retrain models weekly with fresh data from ALL currency pairs."""
+        safe_print("🔄 Starting weekly model retraining with ALL currency pairs...")
         
         try:
             # Import prediction module
             sys.path.append('.')
             from predict_forex_signals import ForexTradingSignalPredictor
             
-            # Use EURUSD as the representative pair to retrain the shared enhanced model
+            # Get ALL available currency pairs for comprehensive training
             pairs = self.db.get_forex_pairs()
-            representative_pair = 'EURUSD' if 'EURUSD' in pairs else pairs[0]
+            safe_print(f"📊 Found {len(pairs)} currency pairs for retraining: {', '.join(pairs)}")
             
-            safe_print(f"🔄 Retraining shared enhanced model using {representative_pair} data...")
+            if not pairs:
+                safe_print("❌ No currency pairs found in database")
+                return
             
-            try:
-                predictor = ForexTradingSignalPredictor(
+            # Collect data from ALL currency pairs for enhanced training
+            safe_print("📊 Collecting data from all currency pairs for comprehensive training...")
+            all_forex_data = []
+            
+            for pair in pairs:
+                try:
+                    safe_print(f"📥 Fetching data for {pair}...")
+                    
+                    # Initialize predictor for this pair
+                    predictor = ForexTradingSignalPredictor(
+                        model_path='./data/best_forex_model.joblib',
+                        currency_pair=pair
+                    )
+                    
+                    # Get extended historical data
+                    forex_data = predictor.get_forex_data(currency_pair=pair, days_back=300)
+                    
+                    if not forex_data.empty:
+                        forex_data['currency_pair'] = pair  # Ensure pair identifier
+                        all_forex_data.append(forex_data)
+                        safe_print(f"✅ {pair}: {len(forex_data)} records collected")
+                    else:
+                        safe_print(f"⚠️ {pair}: No data available")
+                        
+                except Exception as e:
+                    safe_print(f"❌ Error collecting data for {pair}: {e}")
+                    continue
+            
+            # Combine all currency pair data
+            if all_forex_data:
+                combined_data = pd.concat(all_forex_data, ignore_index=True)
+                safe_print(f"📊 Combined dataset: {len(combined_data)} records from {len(all_forex_data)} currency pairs")
+                
+                # Retrain model with combined multi-currency data
+                safe_print("🤖 Training enhanced model with multi-currency dataset...")
+                
+                # Use the first pair's predictor for training (model will work for all pairs)
+                main_predictor = ForexTradingSignalPredictor(
                     model_path='./data/best_forex_model.joblib',
-                    currency_pair=representative_pair
+                    currency_pair=pairs[0]
                 )
                 
-                # Get extended historical data for retraining with signal strength features
-                safe_print("📊 Fetching extended historical data with signal strength indicators...")
-                forex_data = predictor.get_forex_data(currency_pair=representative_pair, days_back=200)
+                success = main_predictor.train_model(combined_data, signal_type='trend')
                 
-                if not forex_data.empty:
-                    safe_print("🤖 Training enhanced model with signal strength features...")
-                    success = predictor.train_model(forex_data, signal_type='trend')
-                    if success:
-                        safe_print("✅ Enhanced forex model retrained successfully for all currency pairs")
-                    else:
-                        safe_print("❌ Failed to retrain enhanced model")
-                else:
-                    safe_print(f"⚠️ No data available for {representative_pair} retraining")
+                if success:
+                    safe_print("✅ Enhanced forex model retrained successfully with ALL currency pairs")
                     
-            except Exception as e:
-                safe_print(f"❌ Error retraining enhanced model: {e}")
+                    # Export model performance to database
+                    try:
+                        self.results_exporter.export_model_performance(
+                            model_results=main_predictor.model_manager.results,
+                            model_name='enhanced_multi_currency_model',
+                            training_pairs=pairs,
+                            training_date=datetime.now()
+                        )
+                        safe_print("✅ Model performance exported to database")
+                    except Exception as e:
+                        safe_print(f"⚠️ Could not export model performance: {e}")
+                        
+                else:
+                    safe_print("❌ Failed to retrain enhanced model")
+            else:
+                safe_print("❌ No data collected from any currency pairs")
             
             safe_print("✅ Weekly model retraining completed")
             

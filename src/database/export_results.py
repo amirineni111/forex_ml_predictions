@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from sqlalchemy import text
 import sys
 import os
@@ -317,63 +317,71 @@ class ForexResultsExporter:
             logger.error(f"❌ Error exporting predictions: {e}")
             return False
     
-    def export_model_performance(self, model_results: Dict[str, Dict[str, float]], 
-                                currency_pair: str, signal_type: str = 'trend',
-                                training_samples: int = 0, features_count: int = 0) -> bool:
+    def export_model_performance(self, model_results: Dict = None, model_name: str = 'forex_ml_model',
+                               training_pairs: List[str] = None, training_date: datetime = None) -> bool:
         """
-        Export model performance metrics to SQL Server.
+        Export model performance metrics to SQL Server for weekly retraining.
         
         Args:
             model_results: Dictionary of model results from training
-            currency_pair: Currency pair the model was trained on
-            signal_type: Type of trading signal used
-            training_samples: Number of samples used for training
-            features_count: Number of features used
+            model_name: Name of the model used
+            training_pairs: List of currency pairs used for training
+            training_date: Date when training occurred
             
         Returns:
             True if successful, False otherwise
         """
         
-        if not model_results:
+        if model_results is None or not model_results:
             logger.warning("No model results to export")
             return False
         
         try:
             performance_records = []
+            training_date = training_date or datetime.now()
+            currency_pairs_str = ','.join(training_pairs) if training_pairs else 'ALL'
             
-            for model_name, metrics in model_results.items():
-                if 'error' not in metrics:  # Skip failed models
+            for model_type, metrics in model_results.items():
+                if isinstance(metrics, dict) and 'cv_accuracy_mean' in metrics:
                     record = {
-                        'model_name': model_name,
-                        'currency_pair': currency_pair,
-                        'training_date': datetime.now(),
-                        'cv_accuracy_mean': metrics.get('cv_accuracy_mean'),
-                        'cv_accuracy_std': metrics.get('cv_accuracy_std'),
-                        'train_accuracy': metrics.get('train_accuracy'),
-                        'train_precision': metrics.get('train_precision'),
-                        'train_recall': metrics.get('train_recall'),
-                        'train_f1': metrics.get('train_f1'),
-                        'train_auc': metrics.get('train_auc'),
-                        'training_samples': training_samples,
-                        'features_count': features_count,
-                        'signal_type': signal_type,
-                        'model_params': str(metrics)  # Store full metrics as JSON-like string
+                        'model_name': f"{model_name}_{model_type}",
+                        'currency_pair': currency_pairs_str,
+                        'training_date': training_date,
+                        'cv_accuracy_mean': metrics.get('cv_accuracy_mean', 0.0),
+                        'cv_accuracy_std': metrics.get('cv_accuracy_std', 0.0),
+                        'train_accuracy': metrics.get('train_accuracy', 0.0),
+                        'train_precision': metrics.get('train_precision', 0.0),
+                        'train_recall': metrics.get('train_recall', 0.0),
+                        'train_f1': metrics.get('train_f1', 0.0),
+                        'train_auc': metrics.get('train_auc', 0.0),
+                        'training_samples': metrics.get('training_samples', 0),
+                        'features_count': metrics.get('features_count', 0),
+                        'signal_type': 'multi_currency',
+                        'model_params': str(metrics)
                     }
                     performance_records.append(record)
             
             if performance_records:
                 performance_df = pd.DataFrame(performance_records)
                 
-                # Export to SQL Server
+                # Export to SQL Server using raw SQL
                 engine = self.db.get_sqlalchemy_engine()
                 
-                performance_df.to_sql(
-                    name=self.model_performance_table,
-                    con=engine,
-                    if_exists='append',
-                    index=False,
-                    method='multi'
-                )
+                insert_sql = f"""
+                    INSERT INTO {self.model_performance_table} 
+                    (model_name, currency_pair, training_date, cv_accuracy_mean, cv_accuracy_std,
+                     train_accuracy, train_precision, train_recall, train_f1, train_auc,
+                     training_samples, features_count, signal_type, model_params)
+                    VALUES (:model_name, :currency_pair, :training_date, :cv_accuracy_mean, :cv_accuracy_std,
+                            :train_accuracy, :train_precision, :train_recall, :train_f1, :train_auc,
+                            :training_samples, :features_count, :signal_type, :model_params)
+                """
+                
+                with engine.connect() as conn:
+                    for _, row in performance_df.iterrows():
+                        param_dict = row.to_dict()
+                        conn.execute(text(insert_sql), param_dict)
+                    conn.commit()
                 
                 logger.info(f"✅ Exported {len(performance_records)} model performance records")
                 return True
