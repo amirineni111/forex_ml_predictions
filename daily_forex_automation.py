@@ -53,6 +53,36 @@ class ForexDailyAutomation:
         self.reports_dir = Path('./daily_reports')
         self.reports_dir.mkdir(exist_ok=True)
         
+    def drop_previous_prediction_tables(self):
+        """Drop previous forex prediction tables to start fresh."""
+        try:
+            safe_print("🗑️ Dropping previous prediction tables...")
+            
+            # Tables to drop
+            tables_to_drop = [
+                'forex_ml_predictions',
+                'forex_daily_summary', 
+                'forex_model_performance'
+            ]
+            
+            engine = self.db.get_sqlalchemy_engine()
+            
+            for table in tables_to_drop:
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(f"DROP TABLE IF EXISTS {table}")
+                        conn.commit()
+                    safe_print(f"✅ Dropped table: {table}")
+                except Exception as e:
+                    safe_print(f"⚠️ Table {table} not found or already dropped: {e}")
+                    
+            safe_print("✅ Previous prediction tables dropped successfully")
+            return True
+            
+        except Exception as e:
+            safe_print(f"❌ Error dropping tables: {e}")
+            return False
+        
     def check_data_availability(self):
         """Check if forex data is available for today."""
         safe_print("🔄 Checking forex data availability...")
@@ -91,24 +121,73 @@ class ForexDailyAutomation:
             safe_print(f"❌ Error checking data: {e}")
             return {}
     
+    def check_data_freshness(self):
+        """Check if the latest data is available before running predictions"""
+        try:
+            safe_print("🔍 Checking data freshness...")
+            
+            # Check a sample currency pair to see latest data
+            test_query = """
+            SELECT 
+                MAX(trading_date) as latest_date,
+                COUNT(*) as record_count
+            FROM forex_hist_data 
+            WHERE trading_date >= CAST(GETDATE() - 1 AS DATE)  -- Check for yesterday/today
+            """
+            
+            df = pd.read_sql_query(test_query, self.db.get_sqlalchemy_engine())
+            
+            if not df.empty:
+                latest_date = df['latest_date'].iloc[0]
+                record_count = df['record_count'].iloc[0]
+                
+                today = datetime.now().date()
+                yesterday = today - timedelta(days=1)
+                
+                if latest_date:
+                    latest_date_obj = pd.to_datetime(latest_date).date()
+                    days_old = (today - latest_date_obj).days
+                    
+                    safe_print(f"📅 Latest forex data: {latest_date} ({record_count} records)")
+                    
+                    if days_old <= 1:
+                        safe_print("✅ Data is fresh (within 1 day)")
+                        return True
+                    else:
+                        safe_print(f"⚠️ Data is {days_old} days old - predictions may use stale data")
+                        return True  # Still proceed but warn user
+                else:
+                    safe_print("⚠️ No recent data found")
+                    return False
+            else:
+                safe_print("❌ No data available")
+                return False
+                
+        except Exception as e:
+            safe_print(f"⚠️ Could not check data freshness: {e}")
+            return True  # Proceed anyway if check fails
+
     def run_daily_predictions(self):
         """Run daily forex predictions for all major pairs."""
         safe_print("🔄 Running daily forex predictions...")
         
         try:
+            # Check if fresh data is available
+            if not self.check_data_freshness():
+                safe_print("⚠️ Proceeding with available data...")
+            
+            # Drop previous prediction tables to start fresh
+            self.drop_previous_prediction_tables()
+            
             # Import prediction module
             sys.path.append('.')
             from predict_forex_signals import ForexTradingSignalPredictor
             
-            # Major forex pairs to analyze
-            major_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD']
-            
-            # Get available pairs from database
+            # Get all available pairs from database for enhanced signal strength analysis
             available_pairs = self.db.get_forex_pairs()
-            pairs_to_analyze = [pair for pair in major_pairs if pair in available_pairs]
+            pairs_to_analyze = available_pairs
             
-            if not pairs_to_analyze:
-                pairs_to_analyze = available_pairs[:6]  # Take first 6 available pairs
+            safe_print(f"📊 Processing all {len(pairs_to_analyze)} available currency pairs with enhanced signal strength features")
             
             safe_print(f"💱 Analyzing pairs: {', '.join(pairs_to_analyze)}")
             
@@ -118,9 +197,9 @@ class ForexDailyAutomation:
                 try:
                     safe_print(f"📊 Processing {pair}...")
                     
-                    # Initialize predictor for this pair
+                    # Initialize predictor for this pair using enhanced model
                     predictor = ForexTradingSignalPredictor(
-                        model_path=f'./data/{pair}_model.joblib',
+                        model_path='./data/best_forex_model.joblib',
                         currency_pair=pair
                     )
                     
@@ -224,39 +303,34 @@ class ForexDailyAutomation:
             sys.path.append('.')
             from predict_forex_signals import ForexTradingSignalPredictor
             
-            # Get available pairs
+            # Use EURUSD as the representative pair to retrain the shared enhanced model
             pairs = self.db.get_forex_pairs()
-            major_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD']
-            pairs_to_retrain = [pair for pair in major_pairs if pair in pairs]
+            representative_pair = 'EURUSD' if 'EURUSD' in pairs else pairs[0]
             
-            if not pairs_to_retrain:
-                pairs_to_retrain = pairs[:6]
+            safe_print(f"🔄 Retraining shared enhanced model using {representative_pair} data...")
             
-            safe_print(f"🔄 Retraining models for: {', '.join(pairs_to_retrain)}")
-            
-            for pair in pairs_to_retrain:
-                try:
-                    safe_print(f"🔧 Retraining model for {pair}...")
-                    
-                    predictor = ForexTradingSignalPredictor(
-                        model_path=f'./data/{pair}_model.joblib',
-                        currency_pair=pair
-                    )
-                    
-                    # Get extended historical data for retraining
-                    forex_data = predictor.get_forex_data(currency_pair=pair, days_back=180)
-                    
-                    if not forex_data.empty:
-                        success = predictor.train_model(forex_data, signal_type='trend')
-                        if success:
-                            safe_print(f"✅ {pair} model retrained successfully")
-                        else:
-                            safe_print(f"❌ Failed to retrain {pair} model")
+            try:
+                predictor = ForexTradingSignalPredictor(
+                    model_path='./data/best_forex_model.joblib',
+                    currency_pair=representative_pair
+                )
+                
+                # Get extended historical data for retraining with signal strength features
+                safe_print("📊 Fetching extended historical data with signal strength indicators...")
+                forex_data = predictor.get_forex_data(currency_pair=representative_pair, days_back=200)
+                
+                if not forex_data.empty:
+                    safe_print("🤖 Training enhanced model with signal strength features...")
+                    success = predictor.train_model(forex_data, signal_type='trend')
+                    if success:
+                        safe_print("✅ Enhanced forex model retrained successfully for all currency pairs")
                     else:
-                        safe_print(f"⚠️ No data available for {pair} retraining")
-                        
-                except Exception as e:
-                    safe_print(f"❌ Error retraining {pair}: {e}")
+                        safe_print("❌ Failed to retrain enhanced model")
+                else:
+                    safe_print(f"⚠️ No data available for {representative_pair} retraining")
+                    
+            except Exception as e:
+                safe_print(f"❌ Error retraining enhanced model: {e}")
             
             safe_print("✅ Weekly model retraining completed")
             

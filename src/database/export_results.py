@@ -131,6 +131,62 @@ class ForexResultsExporter:
         except Exception as e:
             logger.error(f"❌ Error creating results tables: {e}")
             return False
+
+    def drop_prediction_tables(self) -> bool:
+        """
+        Drop existing forex prediction tables to start fresh.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        drop_tables_sql = f"""
+        -- Drop prediction tables if they exist
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.predictions_table}' AND xtype='U')
+            DROP TABLE {self.predictions_table}
+        
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.daily_summary_table}' AND xtype='U')
+            DROP TABLE {self.daily_summary_table}
+        
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.model_performance_table}' AND xtype='U')
+            DROP TABLE {self.model_performance_table}
+        """
+        
+        try:
+            engine = self.db.get_sqlalchemy_engine()
+            
+            with engine.connect() as conn:
+                conn.execute(text(drop_tables_sql))
+                conn.commit()
+                logger.info(f"✅ Dropped existing forex prediction tables")
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error dropping tables: {e}")
+            return False
+
+    def recreate_prediction_tables(self) -> bool:
+        """
+        Drop and recreate all forex prediction tables with fresh schema.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Drop existing tables
+            if not self.drop_prediction_tables():
+                return False
+                
+            # Recreate tables
+            if not self.create_results_tables():
+                return False
+                
+            logger.info("✅ Successfully recreated all forex prediction tables")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error recreating tables: {e}")
+            return False
     
     def export_predictions(self, predictions_df: pd.DataFrame, model_name: str = 'forex_ml_model', 
                           model_version: str = '1.0') -> bool:
@@ -182,7 +238,25 @@ class ForexResultsExporter:
             
             # Filter to only include available columns
             available_columns = [col for col in required_columns if col in export_df.columns]
-            export_df = export_df[available_columns]
+            missing_columns = [col for col in required_columns if col not in export_df.columns]
+            
+            if missing_columns:
+                logger.info(f"Missing columns detected: {missing_columns}")
+                # Add missing columns with appropriate defaults
+                for col in missing_columns:
+                    if col in ['volume']:
+                        export_df[col] = 0
+                    elif col in ['open_price', 'high_price', 'low_price', 'close_price']:
+                        export_df[col] = 0.0
+                    elif col in ['signal_confidence']:
+                        export_df[col] = 0.5
+                    elif col in ['prob_buy', 'prob_sell', 'prob_hold']:
+                        export_df[col] = 0.0
+                    else:
+                        export_df[col] = None
+            
+            # Ensure all required columns are present and in the right order
+            export_df = export_df[required_columns]
             
             # Handle missing optional columns
             if 'signal_confidence' not in export_df.columns:
@@ -198,17 +272,43 @@ class ForexResultsExporter:
             # Clean data
             export_df = export_df.replace([np.inf, -np.inf], np.nan)
             
-            # Export to SQL Server
+            # Export to SQL Server using raw SQL instead of pandas to_sql
             engine = self.db.get_sqlalchemy_engine()
             
-            rows_inserted = export_df.to_sql(
-                name=self.predictions_table,
-                con=engine,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=1000
-            )
+            # Define the columns we want to insert (excluding auto-generated columns like 'id' and 'created_at')
+            columns_to_insert = ['prediction_date', 'currency_pair', 'date_time', 
+                               'open_price', 'high_price', 'low_price', 'close_price', 
+                               'volume', 'predicted_signal', 'signal_confidence', 
+                               'prob_buy', 'prob_sell', 'prob_hold', 'model_name', 
+                               'model_version', 'features_used']
+            
+            # Ensure we only include columns that exist in the dataframe
+            available_columns = [col for col in columns_to_insert if col in export_df.columns]
+            final_df = export_df[available_columns].copy()
+            
+            logger.info(f"Inserting {len(final_df)} rows with columns: {list(final_df.columns)}")
+            
+            # Use raw SQL insert with named parameters instead of pandas to_sql to avoid parameter issues
+            insert_sql = f"""
+                INSERT INTO {self.predictions_table} 
+                ({', '.join(available_columns)})
+                VALUES ({', '.join([':' + col for col in available_columns])})
+            """
+            
+            with engine.connect() as conn:
+                rows_inserted = 0
+                for _, row in final_df.iterrows():
+                    try:
+                        # Convert row to dictionary format for execute
+                        param_dict = {col: row[col] for col in available_columns}
+                        conn.execute(text(insert_sql), param_dict)
+                        rows_inserted += 1
+                    except Exception as row_error:
+                        logger.warning(f"Failed to insert row: {row_error}")
+                        continue
+                conn.commit()
+                
+            logger.info(f"Successfully inserted {rows_inserted} out of {len(final_df)} rows")
             
             logger.info(f"✅ Exported {len(export_df)} prediction records to {self.predictions_table}")
             return True

@@ -78,7 +78,7 @@ class ForexMLModelManager:
         self.scaler: Optional[StandardScaler] = None
         self.label_encoder: Optional[LabelEncoder] = None
         
-        # Forex-specific feature columns
+        # Forex-specific feature columns including signal strengths (numeric only)
         self.forex_feature_columns = [
             # Price data
             'open_price', 'high_price', 'low_price', 'close_price', 'volume',
@@ -88,13 +88,33 @@ class ForexMLModelManager:
             'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_200',
             
             # Technical Indicators
-            'rsi', 'macd', 'macd_signal', 'macd_histogram', 'atr',
+            'rsi_14', 'macd', 'macd_signal', 'atr_14',
             
             # Bollinger Bands
             'bb_upper', 'bb_middle', 'bb_lower', 'bb_width', 'bb_percent',
             
+            # Signal Strength Features (encoded as numeric)
+            'rsi_signal_strength_encoded', 'macd_signal_strength_encoded', 'macd_trade_signal_encoded',
+            'sma_200_signal_encoded', 'sma_100_signal_encoded', 'sma_50_signal_encoded', 'sma_20_signal_encoded',
+            'ema_200_signal_encoded', 'ema_100_signal_encoded', 'ema_50_signal_encoded', 'ema_20_signal_encoded',
+            'sma_trade_signal_encoded', 'bb_signal_strength_encoded', 'atr_signal_strength_encoded',
+            
             # Derived features
-            'daily_return', 'volatility', 'price_range', 'gap', 'volume_ratio'
+            'daily_return', 'volatility', 'price_range', 'gap', 'volume_ratio',
+            
+            # Engineered features (will be calculated)
+            'price_momentum_5', 'price_momentum_10', 'price_position',
+            'price_vs_sma_20', 'price_vs_sma_50', 'price_vs_ema_20',
+            'sma20_vs_sma50', 'ema20_vs_ema50', 'rsi_oversold', 'rsi_overbought',
+            'rsi_momentum', 'rsi_price_divergence', 'bb_squeeze', 'bb_breakout_upper', 'bb_breakout_lower',
+            'macd_signal_cross', 'volatility_10', 'volatility_20',
+            'hour', 'day_of_week', 'month',
+            
+            # Signal strength derived features
+            'combined_signal_strength', 'bullish_signal_count', 'bearish_signal_count', 'signal_agreement',
+            
+            # Backward compatibility
+            'rsi', 'atr', 'macd_histogram'
         ]
         
         # Initialize models based on task type
@@ -207,8 +227,22 @@ class ForexMLModelManager:
                     df_processed['close_price'].shift(1)
                 )
         
-        # Moving average ratios and crossovers
-        ma_columns = [col for col in df_processed.columns if 'sma_' in col or 'ema_' in col]
+        # Convert critical numeric columns to ensure they're numeric (all columns from database)
+        for col in df_processed.columns:
+            # Skip explicitly string columns
+            if col in ['currency_pair', 'date_time'] or 'signal' in col.lower():
+                continue
+            # Try to convert to numeric
+            try:
+                df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce')
+            except:
+                pass
+        
+        # Moving average ratios and crossovers (exclude signal columns)
+        ma_columns = [col for col in df_processed.columns 
+                     if ('sma_' in col or 'ema_' in col) 
+                     and 'signal' not in col.lower() 
+                     and col not in ['ema_bullish', 'macd_bullish']]
         
         if 'close_price' in df_processed.columns:
             for ma_col in ma_columns:
@@ -234,6 +268,13 @@ class ForexMLModelManager:
             df_processed['rsi_oversold'] = (df_processed['rsi_14'] < 30).astype(int)
             df_processed['rsi_overbought'] = (df_processed['rsi_14'] > 70).astype(int)
             df_processed['rsi_momentum'] = df_processed['rsi_14'].diff()
+            # RSI divergence with price
+            if 'close_price' in df_processed.columns:
+                df_processed['rsi_price_divergence'] = (
+                    (df_processed['close_price'].diff() > 0) & (df_processed['rsi_14'].diff() < 0)
+                ).astype(int) - (
+                    (df_processed['close_price'].diff() < 0) & (df_processed['rsi_14'].diff() > 0)
+                ).astype(int)
         
         # Bollinger Bands features
         if all(col in df_processed.columns for col in ['bb_upper', 'bb_lower', 'close_price']):
@@ -253,6 +294,44 @@ class ForexMLModelManager:
                 (df_processed['macd'] > df_processed['macd_signal']).astype(int).diff()
             )
         
+        # Signal Strength Features (encode categorical signals as numeric)
+        signal_columns = {
+            'rsi_signal_strength': {'Overbought (Sell)': -1, 'Oversold (Buy)': 1, 'Neutral': 0},
+            'macd_signal_strength': {'Bullish Crossover': 1, 'Bearish Crossover': -1, 'Neutral': 0, 'No Signal': 0},
+            'macd_trade_signal': {'Buy': 1, 'Sell': -1, 'Hold': 0, 'Neutral': 0, 'No Signal': 0, 'Bullish Crossover': 1, 'Bearish Crossover': -1},
+            'sma_200_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'sma_100_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'sma_50_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'sma_20_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'ema_200_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'ema_100_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'ema_50_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'ema_20_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
+            'sma_trade_signal': {'Buy': 1, 'Sell': -1, 'Hold': 0, 'Neutral': 0},
+            'bb_signal_strength': {'Overbought (Sell)': -1, 'Oversold (Buy)': 1, 'Neutral': 0},
+            'atr_signal_strength': {'High Volatility': 1, 'Low Volatility': -1, 'Normal': 0}
+        }
+        
+        for col, mapping in signal_columns.items():
+            if col in df_processed.columns:
+                try:
+                    # Convert to string first to handle any data type issues
+                    df_processed[col] = df_processed[col].astype(str)
+                    df_processed[f'{col}_encoded'] = df_processed[col].map(mapping).fillna(0)
+                    # Ensure the encoded column is numeric
+                    df_processed[f'{col}_encoded'] = pd.to_numeric(df_processed[f'{col}_encoded'], errors='coerce').fillna(0)
+                except Exception as e:
+                    print(f"Warning: Error encoding {col}: {e}")
+                    df_processed[f'{col}_encoded'] = 0
+        
+        # Signal strength aggregation (combined signal score)
+        signal_score_cols = [f'{col}_encoded' for col in signal_columns.keys() if f'{col}_encoded' in df_processed.columns]
+        if signal_score_cols:
+            df_processed['combined_signal_strength'] = df_processed[signal_score_cols].mean(axis=1)
+            df_processed['bullish_signal_count'] = (df_processed[signal_score_cols] > 0).sum(axis=1)
+            df_processed['bearish_signal_count'] = (df_processed[signal_score_cols] < 0).sum(axis=1)
+            df_processed['signal_agreement'] = df_processed['bullish_signal_count'] - df_processed['bearish_signal_count']
+        
         # Volume features (if volume data available)
         if 'volume' in df_processed.columns:
             df_processed['volume_ma_20'] = df_processed['volume'].rolling(20).mean()
@@ -270,6 +349,29 @@ class ForexMLModelManager:
             df_processed['hour'] = pd.to_datetime(df_processed['date_time']).dt.hour
             df_processed['day_of_week'] = pd.to_datetime(df_processed['date_time']).dt.dayofweek
             df_processed['month'] = pd.to_datetime(df_processed['date_time']).dt.month
+        
+        # Create missing SMA/EMA features if needed
+        sma_ema_periods = {'sma': [5, 10], 'ema': [5, 10]}
+        
+        for ma_type, periods in sma_ema_periods.items():
+            for period in periods:
+                col_name = f'{ma_type}_{period}'
+                if col_name not in df_processed.columns and 'close_price' in df_processed.columns:
+                    if ma_type == 'sma':
+                        df_processed[col_name] = df_processed['close_price'].rolling(window=period).mean()
+                    else:  # EMA
+                        df_processed[col_name] = df_processed['close_price'].ewm(span=period).mean()
+        
+        # Map new column names to old names for backward compatibility
+        if 'rsi_14' in df_processed.columns and 'rsi' not in df_processed.columns:
+            df_processed['rsi'] = df_processed['rsi_14']
+        
+        if 'atr_14' in df_processed.columns and 'atr' not in df_processed.columns:
+            df_processed['atr'] = df_processed['atr_14']
+        
+        # Create missing basic features if they don't exist
+        if 'macd_histogram' not in df_processed.columns and all(col in df_processed.columns for col in ['macd', 'macd_signal']):
+            df_processed['macd_histogram'] = df_processed['macd'] - df_processed['macd_signal']
         
         # Remove infinite and NaN values
         df_processed = df_processed.replace([np.inf, -np.inf], np.nan)

@@ -80,7 +80,7 @@ class ForexTradingSignalPredictor:
         
         safe_print("✅ Database connection established")
         
-        # Feature columns for forex predictions
+        # Feature columns for forex predictions (including signal strength)
         self.feature_columns = [
             # Price data
             'open_price', 'high_price', 'low_price', 'close_price', 'volume',
@@ -89,11 +89,17 @@ class ForexTradingSignalPredictor:
             'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
             'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_200',
             
-            # Technical Indicators
-            'rsi', 'macd', 'macd_signal', 'macd_histogram', 'atr',
+            # Technical Indicators (updated column names)
+            'rsi_14', 'macd', 'macd_signal', 'atr_14',
             
             # Bollinger Bands
             'bb_upper', 'bb_middle', 'bb_lower', 'bb_width', 'bb_percent',
+            
+            # Signal Strength Features (like NSE/NASDAQ models)
+            'rsi_signal_strength', 'macd_signal_strength', 'macd_trade_signal',
+            'sma_200_signal', 'sma_100_signal', 'sma_50_signal', 'sma_20_signal',
+            'ema_200_signal', 'ema_100_signal', 'ema_50_signal', 'ema_20_signal',
+            'sma_trade_signal', 'bb_signal_strength', 'atr_signal_strength',
             
             # Derived features
             'daily_return', 'volatility', 'price_range', 'gap', 'volume_ratio',
@@ -102,9 +108,18 @@ class ForexTradingSignalPredictor:
             'price_momentum_5', 'price_momentum_10', 'price_position',
             'price_vs_sma_20', 'price_vs_sma_50', 'price_vs_ema_20',
             'sma20_vs_sma50', 'ema20_vs_ema50', 'rsi_oversold', 'rsi_overbought',
-            'rsi_momentum', 'bb_squeeze', 'bb_breakout_upper', 'bb_breakout_lower',
-            'macd_signal_cross', 'volume_ratio', 'volatility_10', 'volatility_20',
-            'hour', 'day_of_week', 'month'
+            'rsi_momentum', 'rsi_price_divergence', 'bb_squeeze', 'bb_breakout_upper', 'bb_breakout_lower',
+            'macd_signal_cross', 'volatility_10', 'volatility_20',
+            'hour', 'day_of_week', 'month',
+            
+            # Signal strength derived features
+            'combined_signal_strength', 'bullish_signal_count', 'bearish_signal_count', 'signal_agreement',
+            
+            # Encoded signal features
+            'rsi_signal_strength_encoded', 'macd_signal_strength_encoded', 'macd_trade_signal_encoded',
+            'sma_200_signal_encoded', 'sma_100_signal_encoded', 'sma_50_signal_encoded', 'sma_20_signal_encoded',
+            'ema_200_signal_encoded', 'ema_100_signal_encoded', 'ema_50_signal_encoded', 'ema_20_signal_encoded',
+            'sma_trade_signal_encoded', 'bb_signal_strength_encoded', 'atr_signal_strength_encoded'
         ]
     
     def load_model_artifacts(self):
@@ -171,9 +186,10 @@ class ForexTradingSignalPredictor:
             # Prepare forex-specific features
             df_features = self.model_manager.prepare_forex_features(df)
             
-            # Select available feature columns
-            available_features = [col for col in self.feature_columns if col in df_features.columns]
-            missing_features = [col for col in self.feature_columns if col not in df_features.columns]
+            # Select available feature columns (use model's expected features)
+            model_feature_columns = self.model_manager.forex_feature_columns
+            available_features = [col for col in model_feature_columns if col in df_features.columns]
+            missing_features = [col for col in model_feature_columns if col not in df_features.columns]
             
             if missing_features:
                 safe_print(f"⚠️ Missing features: {', '.join(missing_features[:5])}...")
@@ -214,8 +230,8 @@ class ForexTradingSignalPredictor:
             # Prepare features
             df_features = self.model_manager.prepare_forex_features(df_with_signals)
             
-            # Select features and target
-            available_features = [col for col in self.feature_columns if col in df_features.columns]
+            # Select features and target (use model's feature columns)
+            available_features = [col for col in self.model_manager.forex_feature_columns if col in df_features.columns]
             
             if len(available_features) < 10:
                 safe_print(f"❌ Too few features available: {len(available_features)}")

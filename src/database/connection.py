@@ -171,7 +171,7 @@ class ForexSQLServerConnection:
             # Base query with limit
             limit_clause = f"TOP {limit}" if limit else ""
             
-            # Comprehensive query using your existing forex views
+            # Comprehensive query using your existing forex views with signal strength indicators
             query = f"""
             SELECT {limit_clause}
                 h.symbol as currency_pair,
@@ -186,20 +186,22 @@ class ForexSQLServerConnection:
                 (h.high_price - h.low_price) as daily_range,
                 ((h.close_price - h.open_price) / NULLIF(h.open_price, 0) * 100) as daily_return,
                 
-                -- RSI indicators
+                -- RSI indicators with signal strength
                 ISNULL(rsi.RSI, 50) as rsi_14,
+                ISNULL(rsi_signals.rsi_trade_signal, 'Neutral') as rsi_signal_strength,
                 CASE WHEN rsi.RSI > 70 THEN 'Overbought'
                      WHEN rsi.RSI < 30 THEN 'Oversold'
                      ELSE 'Neutral' END as rsi_signal,
                      
-                -- MACD indicators
+                -- MACD indicators with signal strength
                 ISNULL(macd.EMA_12, h.close_price) as ema_12,
                 ISNULL(macd.EMA_26, h.close_price) as ema_26,
                 ISNULL(macd.MACD, 0) as macd,
                 ISNULL(macd.Signal_Line, 0) as macd_signal,
-                ISNULL(macd.MACD_Signal, 'Neutral') as macd_signal_text,
+                ISNULL(macd.MACD_Signal, 'Neutral') as macd_signal_strength,
+                ISNULL(macd_signals.MACD_Signal, 'Neutral') as macd_trade_signal,
                 
-                -- EMA/SMA indicators
+                -- EMA/SMA indicators with signal flags
                 ISNULL(ema.SMA_200, h.close_price) as sma_200,
                 ISNULL(ema.SMA_100, h.close_price) as sma_100,
                 ISNULL(ema.SMA_50, h.close_price) as sma_50,
@@ -208,16 +210,26 @@ class ForexSQLServerConnection:
                 ISNULL(ema.EMA_100, h.close_price) as ema_100,
                 ISNULL(ema.EMA_50, h.close_price) as ema_50,
                 ISNULL(ema.EMA_20, h.close_price) as ema_20,
+                -- SMA/EMA signal strength flags
+                ISNULL(ema.SMA_200_Flag, 'Neutral') as sma_200_signal,
+                ISNULL(ema.SMA_100_Flag, 'Neutral') as sma_100_signal,
+                ISNULL(ema.SMA_50_Flag, 'Neutral') as sma_50_signal,
+                ISNULL(ema.SMA_20_Flag, 'Neutral') as sma_20_signal,
+                ISNULL(ema.EMA_200_Flag, 'Neutral') as ema_200_signal,
+                ISNULL(ema.EMA_100_Flag, 'Neutral') as ema_100_signal,
+                ISNULL(ema.EMA_50_Flag, 'Neutral') as ema_50_signal,
+                ISNULL(ema.EMA_20_Flag, 'Neutral') as ema_20_signal,
+                ISNULL(sma_signals.sma_trade_signal, 'Neutral') as sma_trade_signal,
                 
-                -- Bollinger Bands
+                -- Bollinger Bands with signal strength
                 ISNULL(bb.SMA_20, h.close_price) as bb_middle,
                 ISNULL(bb.Upper_Band, h.close_price * 1.02) as bb_upper,
                 ISNULL(bb.Lower_Band, h.close_price * 0.98) as bb_lower,
-                'Neutral' as bb_signal,
+                ISNULL(bb_signals.bb_trade_signal, 'Neutral') as bb_signal_strength,
                 
-                -- ATR for volatility
+                -- ATR for volatility with signal strength
                 ISNULL(atr.ATR_14, (h.high_price - h.low_price)) as atr_14,
-                'Neutral' as atr_signal,
+                ISNULL(atr_spikes.atr_volatility_signal, 'Normal') as atr_signal_strength,
                 
                 -- Additional features for ML
                 CASE WHEN h.close_price > ISNULL(ema.SMA_20, h.close_price) THEN 1 ELSE 0 END as price_above_sma20,
@@ -227,13 +239,18 @@ class ForexSQLServerConnection:
                 
             FROM forex_hist_data h
             LEFT JOIN forex_RSI_calculation rsi ON h.symbol = rsi.symbol AND h.trading_date = rsi.trading_date
+            LEFT JOIN forex_rsi_signals rsi_signals ON h.symbol = rsi_signals.symbol AND h.trading_date = rsi_signals.trading_date
             LEFT JOIN forex_macd macd ON h.symbol = macd.symbol AND h.trading_date = macd.trading_date
+            LEFT JOIN forex_macd_signals macd_signals ON h.symbol = macd_signals.symbol AND h.trading_date = macd_signals.trading_date
             LEFT JOIN forex_ema_sma_view ema ON h.symbol = ema.symbol AND h.trading_date = ema.trading_date
+            LEFT JOIN forex_sma_signals sma_signals ON h.symbol = sma_signals.symbol AND h.trading_date = sma_signals.trading_date
             LEFT JOIN forex_bollingerband bb ON h.symbol = bb.symbol AND h.trading_date = bb.trading_date
+            LEFT JOIN forex_bb_signals bb_signals ON h.symbol = bb_signals.symbol AND h.trading_date = bb_signals.trading_date
             LEFT JOIN forex_atr atr ON h.symbol = atr.symbol AND h.trading_date = atr.trading_date
+            LEFT JOIN forex_atr_spikes atr_spikes ON h.symbol = atr_spikes.symbol AND h.trading_date = atr_spikes.trading_date
             
             WHERE h.symbol = '{currency_pair}'
-            ORDER BY h.trading_date ASC
+            ORDER BY h.trading_date DESC
             """
             
             # Execute query
@@ -270,7 +287,8 @@ class ForexSQLServerConnection:
         self, 
         currency_pair: str,
         days_back: int = 365,
-        min_records: int = 100
+        min_records: int = 100,
+        include_today: bool = True
     ) -> pd.DataFrame:
         """
         Get forex data suitable for ML model training.
@@ -279,11 +297,29 @@ class ForexSQLServerConnection:
             currency_pair: Specific currency pair
             days_back: Number of days to look back
             min_records: Minimum number of records required
+            include_today: Whether to include today's data if available
             
         Returns:
             DataFrame with training data
         """
+        # For training, we get all data and let the model use what it needs
         df = self.get_forex_data_with_indicators(currency_pair=currency_pair)
+        
+        if include_today:
+            # Ensure we have the latest possible data by checking today's date
+            latest_date_query = f"""
+            SELECT MAX(trading_date) as latest_date
+            FROM forex_hist_data 
+            WHERE symbol = '{currency_pair}'
+            """
+            
+            try:
+                latest_df = pd.read_sql_query(latest_date_query, self.get_sqlalchemy_engine())
+                if not latest_df.empty and latest_df['latest_date'].iloc[0]:
+                    latest_date = latest_df['latest_date'].iloc[0]
+                    logger.info(f"Latest data available for {currency_pair}: {latest_date}")
+            except Exception as e:
+                logger.warning(f"Could not check latest date for {currency_pair}: {e}")
         
         if len(df) < min_records:
             logger.warning(f"Only {len(df)} records found, less than minimum {min_records}")
