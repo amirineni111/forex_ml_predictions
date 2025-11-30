@@ -31,15 +31,35 @@ def create_forward_prediction(df_recent, predictions, probabilities, currency_pa
     while tomorrow.weekday() >= 5:  # Saturday = 5, Sunday = 6
         tomorrow = tomorrow + timedelta(days=1)
     
+    # Get recent close price for realistic estimates
+    recent_close = df_recent['close_price'].iloc[0]
+    
+    # Check if current data looks artificial (all OHLC are identical)
+    current_open = df_recent['open_price'].iloc[0]
+    current_high = df_recent['high_price'].iloc[0]
+    current_low = df_recent['low_price'].iloc[0]
+    
+    is_artificial_data = (current_open == current_high == current_low == recent_close)
+    
+    if is_artificial_data:
+        # Use more conservative estimates for artificial data
+        estimated_high = round(recent_close * 1.001, 5)  # 0.1% range
+        estimated_low = round(recent_close * 0.999, 5)
+        print(f"⚠️ Detected artificial data for {currency_pair}, using conservative estimates")
+    else:
+        # Use actual high/low as reference for real market data
+        estimated_high = current_high
+        estimated_low = current_low
+    
     # Create prediction record for TOMORROW
     prediction_record = {
         'prediction_date': tomorrow,  # TOMORROW's date
         'currency_pair': currency_pair,
         'date_time': tomorrow,  # Prediction is for tomorrow
-        'open_price': df_recent['close_price'].iloc[0],  # Use today's close as tomorrow's expected open
-        'high_price': df_recent['high_price'].iloc[0],   # Copy today's values for reference
-        'low_price': df_recent['low_price'].iloc[0],
-        'close_price': df_recent['close_price'].iloc[0],
+        'open_price': recent_close,  # Use today's close as tomorrow's expected open
+        'high_price': estimated_high,  # Either real high or conservative estimate
+        'low_price': estimated_low,   # Either real low or conservative estimate
+        'close_price': recent_close,  # Expected close same as open initially
         'volume': df_recent['volume'].iloc[0] if 'volume' in df_recent.columns else 0,
         'predicted_signal': predictions[0],
         'signal_confidence': 0.0,
@@ -93,6 +113,18 @@ def predict_next_day_signals(predictor, currency_pair):
             return pd.DataFrame()
         
         latest_date = df_today['date_time'].iloc[0]
+        
+        # Check for artificial data in recent records
+        recent_records = df_features.tail(3)
+        artificial_count = 0
+        for _, row in recent_records.iterrows():
+            if (row.get('open_price') == row.get('high_price') == 
+                row.get('low_price') == row.get('close_price')):
+                artificial_count += 1
+        
+        if artificial_count >= 2:
+            print(f"⚠️ Warning: Detected {artificial_count} artificial data records in recent {currency_pair} data")
+        
         print(f"📊 Using data from: {latest_date} to predict NEXT trading day")
         
         # Make prediction for TOMORROW using TODAY's data

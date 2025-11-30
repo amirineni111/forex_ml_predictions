@@ -264,7 +264,7 @@ class ForexDailyAutomation:
             safe_print("📄 Generating summary report...")
             
             # Signal distribution
-            signal_summary = predictions_df.groupby(['currency_pair', 'signal']).size().unstack(fill_value=0)
+            signal_summary = predictions_df.groupby(['currency_pair', 'predicted_signal']).size().unstack(fill_value=0)
             
             # Recent signals
             recent_signals = predictions_df.sort_values('date_time').tail(20)
