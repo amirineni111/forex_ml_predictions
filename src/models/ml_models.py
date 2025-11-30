@@ -373,6 +373,32 @@ class ForexMLModelManager:
         if 'macd_histogram' not in df_processed.columns and all(col in df_processed.columns for col in ['macd', 'macd_signal']):
             df_processed['macd_histogram'] = df_processed['macd'] - df_processed['macd_signal']
         
+        # Calculate MACD if missing and close_price is available
+        if 'close_price' in df_processed.columns:
+            # Check if MACD values are missing or if recent values are zeros
+            macd_missing = False
+            if 'macd' not in df_processed.columns:
+                macd_missing = True
+            else:
+                # Check if the most recent 10 records have zero MACD values
+                recent_macd = df_processed['macd'].fillna(0).tail(10)
+                if recent_macd.abs().max() < 1e-6:
+                    macd_missing = True
+                    
+            if macd_missing:
+                # Calculate MACD using 12-day and 26-day EMAs
+                ema_12 = df_processed['close_price'].ewm(span=12).mean()
+                ema_26 = df_processed['close_price'].ewm(span=26).mean()
+                df_processed['macd'] = ema_12 - ema_26
+                
+                # Calculate MACD signal line (9-day EMA of MACD)
+                df_processed['macd_signal'] = df_processed['macd'].ewm(span=9).mean()
+                
+                # Calculate MACD histogram
+                df_processed['macd_histogram'] = df_processed['macd'] - df_processed['macd_signal']
+                
+                logger.info("🔧 Calculated MACD indicators from price data (recent database values were missing or zero)")
+        
         # Remove infinite and NaN values
         df_processed = df_processed.replace([np.inf, -np.inf], np.nan)
         

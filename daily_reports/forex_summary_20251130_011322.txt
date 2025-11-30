@@ -1,0 +1,32 @@
+Forex Trading Signals Summary
+Generated: 2025-11-30 01:13:22.505471
+==================================================
+
+Signal Distribution by Currency Pair:
+----------------------------------------
+predicted_signal  BUY  HOLD  SELL
+currency_pair                    
+AUDUSD              0     0     1
+EURCHF              0     0     1
+EURJPY              1     0     0
+EURUSD              0     0     1
+GBPUSD              0     0     1
+NZDUSD              0     0     1
+USDHKD              0     1     0
+USDINR              0     0     1
+USDJPY              1     0     0
+USDSGD              1     0     0
+
+Recent Signals:
+--------------------
+ date_time currency_pair  close_price
+2025-12-01        AUDUSD     0.655222
+2025-12-01        EURCHF     0.933270
+2025-12-01        EURJPY   181.281998
+2025-12-01        EURUSD     1.159985
+2025-12-01        GBPUSD     1.324118
+2025-12-01        NZDUSD     0.573100
+2025-12-01        USDHKD     7.778700
+2025-12-01        USDINR    89.364800
+2025-12-01        USDJPY   156.283997
+2025-12-01        USDSGD     1.296720

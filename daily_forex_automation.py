@@ -193,6 +193,7 @@ class ForexDailyAutomation:
             safe_print(f"💱 Analyzing pairs: {', '.join(pairs_to_analyze)}")
             
             all_predictions = []
+            all_features = []
             
             for pair in pairs_to_analyze:
                 try:
@@ -203,6 +204,16 @@ class ForexDailyAutomation:
                         model_path='./data/best_forex_model.joblib',
                         currency_pair=pair
                     )
+                    
+                    # Get feature data for export
+                    df = predictor.get_forex_data(currency_pair=pair, days_back=100)
+                    df_features, available_features = predictor.prepare_features(df)
+                    df_recent = df_features.dropna(subset=available_features).tail(1)
+                    
+                    if not df_recent.empty:
+                        # Prepare feature record
+                        feature_record = df_recent[available_features + ['currency_pair']].copy()
+                        all_features.append(feature_record)
                     
                     # Generate FORWARD-LOOKING prediction for next trading day
                     from src.utils.forward_prediction import predict_next_day_signals
@@ -223,6 +234,13 @@ class ForexDailyAutomation:
                 import pandas as pd
                 combined_predictions = pd.concat(all_predictions, ignore_index=True)
                 
+                # Combine all features
+                if all_features:
+                    combined_features = pd.concat(all_features, ignore_index=True)
+                    safe_print(f"📊 Collected {len(combined_features)} feature records for export")
+                else:
+                    combined_features = pd.DataFrame()
+                
                 # Export to database
                 safe_print("📊 Exporting predictions to SQL Server...")
                 self.results_exporter.create_results_tables()
@@ -230,6 +248,18 @@ class ForexDailyAutomation:
                     combined_predictions, 
                     model_name='daily_automation_model'
                 )
+                
+                # Export feature values to new table
+                if not combined_features.empty:
+                    safe_print("📊 Exporting feature values to SQL Server...")
+                    feature_success = self.results_exporter.export_prediction_features(
+                        combined_features, 
+                        combined_predictions
+                    )
+                    if feature_success:
+                        safe_print("✅ Feature values exported to database")
+                    else:
+                        safe_print("⚠️ Could not export feature values")
                 
                 if db_success:
                     # Export daily summary
