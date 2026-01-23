@@ -431,31 +431,6 @@ class ForexTradingSignalPredictor:
         except Exception as e:
             safe_print(f"❌ Error exporting to database: {e}")
             return False
-    
-    def export_predictions(self, predictions_df, filename=None):
-        """Export predictions to CSV file"""
-        
-        if predictions_df.empty:
-            safe_print("❌ No predictions to export")
-            return False
-        
-        try:
-            if filename is None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"./results/forex_predictions_{timestamp}.csv"
-            
-            # Create results directory
-            Path(filename).parent.mkdir(parents=True, exist_ok=True)
-            
-            # Export to CSV
-            predictions_df.to_csv(filename, index=False)
-            safe_print(f"✅ Predictions exported to {filename}")
-            
-            return True
-            
-        except Exception as e:
-            safe_print(f"❌ Error exporting predictions: {e}")
-            return False
 
 
 def main():
@@ -466,7 +441,6 @@ def main():
     parser.add_argument('--days-back', type=int, default=60, help='Days of historical data')
     parser.add_argument('--model-path', type=str, help='Path to saved model file')
     parser.add_argument('--train-new', action='store_true', help='Train a new model')
-    parser.add_argument('--export', action='store_true', help='Export predictions to CSV')
     parser.add_argument('--export-db', action='store_true', help='Export predictions to SQL Server database')
     parser.add_argument('--setup-tables', action='store_true', help='Setup database tables for results storage')
     parser.add_argument('--signal-type', type=str, default='trend', 
@@ -518,10 +492,6 @@ def main():
     if predictions.empty:
         safe_print("❌ No predictions generated")
         return
-    
-    # Export predictions if requested
-    if args.export:
-        predictor.export_predictions(predictions)
     
     # Export to database if requested
     if args.export_db:

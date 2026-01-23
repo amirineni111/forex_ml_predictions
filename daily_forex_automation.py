@@ -51,8 +51,6 @@ class ForexDailyAutomation:
         """Initialize the automation system."""
         self.db = ForexSQLServerConnection()
         self.results_exporter = ForexResultsExporter(self.db)
-        self.reports_dir = Path('./daily_reports')
-        self.reports_dir.mkdir(exist_ok=True)
         
     def drop_previous_prediction_tables(self):
         """Drop previous forex prediction tables to start fresh."""
@@ -269,16 +267,6 @@ class ForexDailyAutomation:
                     )
                     safe_print("✅ Predictions exported to database")
                 
-                # Save daily report
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                report_file = self.reports_dir / f"forex_signals_{timestamp}.csv"
-                combined_predictions.to_csv(report_file, index=False)
-                
-                safe_print(f"📄 Daily report saved: {report_file}")
-                
-                # Generate summary
-                self.generate_summary_report(combined_predictions)
-                
                 return True
             else:
                 safe_print("❌ No predictions generated for any pairs")
@@ -287,44 +275,6 @@ class ForexDailyAutomation:
         except Exception as e:
             safe_print(f"❌ Error in daily predictions: {e}")
             return False
-    
-    def generate_summary_report(self, predictions_df):
-        """Generate a summary report of predictions."""
-        try:
-            safe_print("📄 Generating summary report...")
-            
-            # Signal distribution
-            signal_summary = predictions_df.groupby(['currency_pair', 'predicted_signal']).size().unstack(fill_value=0)
-            
-            # Recent signals
-            recent_signals = predictions_df.sort_values('date_time').tail(20)
-            
-            # Create summary report
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            summary_file = self.reports_dir / f"forex_summary_{timestamp}.txt"
-            
-            with open(summary_file, 'w') as f:
-                f.write(f"Forex Trading Signals Summary\n")
-                f.write(f"Generated: {datetime.now()}\n")
-                f.write("=" * 50 + "\n\n")
-                
-                f.write("Signal Distribution by Currency Pair:\n")
-                f.write("-" * 40 + "\n")
-                f.write(signal_summary.to_string())
-                f.write("\n\n")
-                
-                f.write("Recent Signals:\n")
-                f.write("-" * 20 + "\n")
-                cols = ['date_time', 'currency_pair', 'close_price', 'signal']
-                if 'confidence' in recent_signals.columns:
-                    cols.append('confidence')
-                display_cols = [col for col in cols if col in recent_signals.columns]
-                f.write(recent_signals[display_cols].to_string(index=False))
-                
-            safe_print(f"📋 Summary report saved: {summary_file}")
-            
-        except Exception as e:
-            safe_print(f"❌ Error generating summary: {e}")
     
     def retrain_models_weekly(self):
         """Retrain models weekly with fresh data from ALL currency pairs."""

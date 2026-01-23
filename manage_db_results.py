@@ -122,35 +122,6 @@ def view_model_performance(model_name=None, currency_pair=None):
         safe_print(f"❌ Error retrieving performance history: {e}")
 
 
-def export_csv_report(output_file=None, days=7):
-    """Export recent predictions to CSV file."""
-    if output_file is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"./results/forex_db_export_{timestamp}.csv"
-    
-    safe_print(f"📄 Exporting recent predictions to {output_file}...")
-    
-    exporter = ForexResultsExporter()
-    
-    try:
-        df = exporter.get_recent_predictions(days_back=days)
-        
-        if df.empty:
-            safe_print("📭 No predictions to export")
-            return
-        
-        # Create output directory if needed
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        
-        # Export to CSV
-        df.to_csv(output_file, index=False)
-        
-        safe_print(f"✅ Exported {len(df)} predictions to {output_file}")
-        
-    except Exception as e:
-        safe_print(f"❌ Error exporting to CSV: {e}")
-
-
 def cleanup_old_predictions(days_to_keep=30):
     """Clean up old prediction records from the database."""
     safe_print(f"🗑️ Cleaning up predictions older than {days_to_keep} days...")
@@ -198,11 +169,6 @@ def main():
     view_perf_parser.add_argument('--model-name', type=str, help='Filter by model name')
     view_perf_parser.add_argument('--currency-pair', type=str, help='Filter by currency pair')
     
-    # Export command
-    export_parser = subparsers.add_parser('export', help='Export predictions to CSV')
-    export_parser.add_argument('--output', type=str, help='Output CSV file path')
-    export_parser.add_argument('--days', type=int, default=7, help='Number of days to export')
-    
     # Cleanup command
     cleanup_parser = subparsers.add_parser('cleanup', help='Cleanup old predictions')
     cleanup_parser.add_argument('--days-to-keep', type=int, default=30, help='Days of data to keep')
@@ -229,12 +195,6 @@ def main():
         view_model_performance(
             model_name=args.model_name,
             currency_pair=args.currency_pair
-        )
-        
-    elif args.command == 'export':
-        export_csv_report(
-            output_file=args.output,
-            days=args.days
         )
         
     elif args.command == 'cleanup':

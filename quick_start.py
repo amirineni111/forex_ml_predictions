@@ -182,7 +182,6 @@ def setup_directories():
         './data',
         './results', 
         './reports',
-        './daily_reports',
         './logs'
     ]
     
