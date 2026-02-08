@@ -1,8 +1,17 @@
 """
-Forex ML Models Module
+Forex ML Models Module - Enhanced for Direction Accuracy
 
 This module provides machine learning models specifically designed for forex trading
 signal prediction using technical indicators like BB, EMA, SMA, RSI, MACD, ATR.
+
+Key improvements over previous version:
+- Adaptive volatility-based thresholds for signal generation
+- Binary direction prediction (UP/DOWN) for better accuracy  
+- Purged time-series cross-validation to prevent data leakage
+- Exponential sample weighting to prioritize recent data
+- Anti-overfitting measures (reduced complexity, regularization)
+- Probability calibration for reliable confidence scores
+- Walk-forward validation for realistic performance estimates
 """
 
 import pandas as pd
@@ -36,6 +45,7 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 # Advanced ML libraries
 try:
@@ -50,17 +60,59 @@ try:
 except ImportError:
     HAS_LIGHTGBM = False
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
 
+class PurgedTimeSeriesSplit:
+    """
+    Time series cross-validation with purge gap to prevent data leakage.
+    
+    Unlike standard TimeSeriesSplit, this adds a gap between train and validation
+    sets to prevent information from the future leaking into training data.
+    """
+    
+    def __init__(self, n_splits=5, purge_gap=5):
+        """
+        Args:
+            n_splits: Number of CV splits
+            purge_gap: Number of samples to skip between train and validation
+        """
+        self.n_splits = n_splits
+        self.purge_gap = purge_gap
+    
+    def split(self, X, y=None, groups=None):
+        n_samples = len(X)
+        min_train_size = max(50, n_samples // (self.n_splits + 2))
+        fold_size = max(20, (n_samples - min_train_size) // self.n_splits)
+        
+        for i in range(self.n_splits):
+            train_end = min_train_size + i * fold_size
+            val_start = train_end + self.purge_gap
+            val_end = min(val_start + fold_size, n_samples)
+            
+            if val_start >= n_samples or val_end <= val_start:
+                continue
+            
+            train_indices = np.arange(0, train_end)
+            val_indices = np.arange(val_start, val_end)
+            
+            yield train_indices, val_indices
+    
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+
 class ForexMLModelManager:
     """
     Comprehensive machine learning model manager for forex trading signals.
     
-    Specialized for forex data with technical indicators and time series patterns.
+    Enhanced with anti-overfitting measures, adaptive thresholds, 
+    and purged time-series validation.
     """
     
     def __init__(self, task_type: str = 'classification'):
@@ -75,8 +127,10 @@ class ForexMLModelManager:
         self.results: Dict[str, Dict[str, float]] = {}
         self.best_model: Optional[Any] = None
         self.best_model_name: Optional[str] = None
-        self.scaler: Optional[StandardScaler] = None
+        self.scaler: Optional[RobustScaler] = None
         self.label_encoder: Optional[LabelEncoder] = None
+        self.feature_importance_scores: Optional[pd.DataFrame] = None
+        self.training_metadata: Dict[str, Any] = {}
         
         # Forex-specific feature columns including signal strengths (numeric only)
         self.forex_feature_columns = [
@@ -121,72 +175,111 @@ class ForexMLModelManager:
         self._initialize_models()
     
     def _initialize_models(self):
-        """Initialize forex-specific models based on task type."""
+        """Initialize forex-specific models with anti-overfitting parameters."""
         
         base_models = {}
         
         if self.task_type == 'classification':
             base_models = {
+                # Logistic Regression - good baseline, naturally regularized
                 'logistic_regression': LogisticRegression(
-                    random_state=42, max_iter=1000, class_weight='balanced'
+                    random_state=42, max_iter=1000, C=0.5,
+                    class_weight='balanced', penalty='l2'
                 ),
+                # Random Forest - REDUCED complexity to prevent overfitting
                 'random_forest': RandomForestClassifier(
-                    random_state=42, n_estimators=200, max_depth=10, 
+                    random_state=42, n_estimators=150, 
+                    max_depth=6,           # Reduced from 10
+                    min_samples_split=10,  # Increased from default 2
+                    min_samples_leaf=5,    # Increased from default 1
+                    max_features='sqrt',   # Limit features per tree
                     class_weight='balanced'
                 ),
+                # Extra Trees - REDUCED complexity
                 'extra_trees': ExtraTreesClassifier(
-                    random_state=42, n_estimators=200, max_depth=10,
+                    random_state=42, n_estimators=150, 
+                    max_depth=6,           # Reduced from 10
+                    min_samples_split=10,
+                    min_samples_leaf=5,
+                    max_features='sqrt',
                     class_weight='balanced'
                 ),
+                # Gradient Boosting - HEAVILY constrained to prevent overfitting
                 'gradient_boosting': GradientBoostingClassifier(
-                    random_state=42, n_estimators=200, max_depth=6
+                    random_state=42, 
+                    n_estimators=100,      # Reduced from 200
+                    max_depth=4,           # Reduced from 6
+                    learning_rate=0.05,    # Reduced from default 0.1
+                    min_samples_split=15,  # Increased
+                    min_samples_leaf=8,    # Increased
+                    subsample=0.8,         # Use only 80% of data per tree
+                    max_features='sqrt'    # Limit features
                 ),
-                'svm': SVC(
-                    random_state=42, probability=True, class_weight='balanced'
-                ),
-                'naive_bayes': GaussianNB(),
-                'knn': KNeighborsClassifier(n_neighbors=7)
+                # KNN with fewer neighbors
+                'knn': KNeighborsClassifier(n_neighbors=11, weights='distance')
             }
             
         elif self.task_type == 'regression':
             base_models = {
                 'linear_regression': LinearRegression(),
-                'ridge_regression': Ridge(random_state=42, alpha=1.0),
-                'lasso_regression': Lasso(random_state=42, alpha=1.0),
+                'ridge_regression': Ridge(random_state=42, alpha=10.0),
+                'lasso_regression': Lasso(random_state=42, alpha=0.1),
                 'random_forest': RandomForestRegressor(
-                    random_state=42, n_estimators=200, max_depth=10
+                    random_state=42, n_estimators=150, 
+                    max_depth=6, min_samples_split=10, min_samples_leaf=5
                 ),
                 'extra_trees': ExtraTreesRegressor(
-                    random_state=42, n_estimators=200, max_depth=10
+                    random_state=42, n_estimators=150, 
+                    max_depth=6, min_samples_split=10, min_samples_leaf=5
                 ),
                 'gradient_boosting': GradientBoostingRegressor(
-                    random_state=42, n_estimators=200, max_depth=6
+                    random_state=42, n_estimators=100, max_depth=4,
+                    learning_rate=0.05, subsample=0.8,
+                    min_samples_split=15, min_samples_leaf=8
                 ),
-                'svm': SVR(),
-                'knn': KNeighborsRegressor(n_neighbors=7)
+                'knn': KNeighborsRegressor(n_neighbors=11, weights='distance')
             }
         
-        # Add advanced models if available
+        # Add advanced models if available - with CONSTRAINED parameters
         if HAS_XGBOOST:
             if self.task_type == 'classification':
                 base_models['xgboost'] = xgb.XGBClassifier(
-                    random_state=42, n_estimators=200, max_depth=6,
+                    random_state=42, n_estimators=150, 
+                    max_depth=4,              # Reduced
+                    learning_rate=0.05,       # Slower learning
+                    subsample=0.8,            # Row subsampling
+                    colsample_bytree=0.7,     # Feature subsampling
+                    reg_alpha=1.0,            # L1 regularization
+                    reg_lambda=2.0,           # L2 regularization
+                    min_child_weight=5,       # Minimum leaf weight
                     eval_metric='logloss'
                 )
             else:
                 base_models['xgboost'] = xgb.XGBRegressor(
-                    random_state=42, n_estimators=200, max_depth=6
+                    random_state=42, n_estimators=150, max_depth=4,
+                    learning_rate=0.05, subsample=0.8, colsample_bytree=0.7,
+                    reg_alpha=1.0, reg_lambda=2.0, min_child_weight=5
                 )
         
         if HAS_LIGHTGBM:
             if self.task_type == 'classification':
                 base_models['lightgbm'] = lgb.LGBMClassifier(
-                    random_state=42, n_estimators=200, max_depth=6,
-                    class_weight='balanced', verbosity=-1
+                    random_state=42, n_estimators=150, 
+                    max_depth=4,               # Reduced
+                    learning_rate=0.05,        # Slower learning
+                    subsample=0.8,
+                    colsample_bytree=0.7,
+                    reg_alpha=1.0,             # L1 regularization
+                    reg_lambda=2.0,            # L2 regularization
+                    min_child_samples=10,      # Minimum leaf samples
+                    class_weight='balanced', 
+                    verbosity=-1
                 )
             else:
                 base_models['lightgbm'] = lgb.LGBMRegressor(
-                    random_state=42, n_estimators=200, max_depth=6,
+                    random_state=42, n_estimators=150, max_depth=4,
+                    learning_rate=0.05, subsample=0.8, colsample_bytree=0.7,
+                    reg_alpha=1.0, reg_lambda=2.0, min_child_samples=10,
                     verbosity=-1
                 )
         
@@ -321,7 +414,7 @@ class ForexMLModelManager:
                     # Ensure the encoded column is numeric
                     df_processed[f'{col}_encoded'] = pd.to_numeric(df_processed[f'{col}_encoded'], errors='coerce').fillna(0)
                 except Exception as e:
-                    print(f"Warning: Error encoding {col}: {e}")
+                    logger.warning(f"Warning: Error encoding {col}: {e}")
                     df_processed[f'{col}_encoded'] = 0
         
         # Signal strength aggregation (combined signal score)
@@ -397,7 +490,7 @@ class ForexMLModelManager:
                 # Calculate MACD histogram
                 df_processed['macd_histogram'] = df_processed['macd'] - df_processed['macd_signal']
                 
-                logger.info("🔧 Calculated MACD indicators from price data (recent database values were missing or zero)")
+                logger.info("Calculated MACD indicators from price data (recent database values were missing or zero)")
         
         # Remove infinite and NaN values
         df_processed = df_processed.replace([np.inf, -np.inf], np.nan)
@@ -408,15 +501,20 @@ class ForexMLModelManager:
         self, 
         df: pd.DataFrame, 
         signal_type: str = 'trend',
-        future_periods: int = 5
+        future_periods: int = 1
     ) -> pd.DataFrame:
         """
-        Create trading signals for forex data.
+        Create trading signals for forex data with ADAPTIVE thresholds.
+        
+        Key improvements:
+        - Default to 1-day ahead prediction (was 5-day)
+        - Adaptive threshold based on recent ATR/volatility
+        - Better HOLD zone calibration
         
         Args:
             df: DataFrame with forex data
-            signal_type: Type of signal ('trend', 'momentum', 'mean_reversion')
-            future_periods: Number of periods to look ahead
+            signal_type: Type of signal ('trend', 'momentum', 'mean_reversion', 'direction')
+            future_periods: Number of periods to look ahead (default: 1 for next-day)
             
         Returns:
             DataFrame with trading signals
@@ -431,25 +529,116 @@ class ForexMLModelManager:
             df_signals['close_price'].shift(-future_periods) / df_signals['close_price'] - 1
         )
         
-        if signal_type == 'trend':
-            # Trend following signals
-            df_signals['signal'] = np.where(df_signals['future_return'] > 0.001, 'BUY',
-                                   np.where(df_signals['future_return'] < -0.001, 'SELL', 'HOLD'))
+        # Calculate ADAPTIVE threshold based on recent volatility
+        # Use rolling standard deviation of returns as the threshold basis
+        daily_returns = df_signals['close_price'].pct_change()
+        rolling_vol = daily_returns.rolling(window=20, min_periods=5).std()
+        
+        # Adaptive threshold: fraction of recent volatility
+        # This ensures the threshold adapts to the current market regime
+        adaptive_threshold = rolling_vol * 0.3  # 30% of daily volatility
+        adaptive_threshold = adaptive_threshold.clip(lower=0.0005, upper=0.005)  # Bounds: 0.05% to 0.5%
+        
+        if signal_type == 'direction':
+            # Binary direction prediction (UP/DOWN only - no HOLD)
+            # This typically gives better accuracy than 3-class
+            df_signals['signal'] = np.where(df_signals['future_return'] > 0, 'BUY', 'SELL')
+        
+        elif signal_type == 'trend':
+            # Trend following signals with ADAPTIVE thresholds
+            buy_threshold = adaptive_threshold
+            sell_threshold = -adaptive_threshold
+            
+            df_signals['signal'] = np.where(
+                df_signals['future_return'] > buy_threshold, 'BUY',
+                np.where(df_signals['future_return'] < sell_threshold, 'SELL', 'HOLD')
+            )
         
         elif signal_type == 'momentum':
-            # Momentum-based signals with higher thresholds
-            df_signals['signal'] = np.where(df_signals['future_return'] > 0.002, 'BUY',
-                                   np.where(df_signals['future_return'] < -0.002, 'SELL', 'HOLD'))
+            # Momentum-based signals with higher adaptive thresholds
+            buy_threshold = adaptive_threshold * 1.5
+            sell_threshold = -adaptive_threshold * 1.5
+            
+            df_signals['signal'] = np.where(
+                df_signals['future_return'] > buy_threshold, 'BUY',
+                np.where(df_signals['future_return'] < sell_threshold, 'SELL', 'HOLD')
+            )
         
         elif signal_type == 'mean_reversion':
             # Mean reversion signals (opposite direction)
-            df_signals['signal'] = np.where(df_signals['future_return'] > 0.001, 'SELL',
-                                   np.where(df_signals['future_return'] < -0.001, 'BUY', 'HOLD'))
+            buy_threshold = adaptive_threshold
+            sell_threshold = -adaptive_threshold
+            
+            df_signals['signal'] = np.where(
+                df_signals['future_return'] > buy_threshold, 'SELL',
+                np.where(df_signals['future_return'] < sell_threshold, 'BUY', 'HOLD')
+            )
         
         # Remove rows where we can't calculate future returns
         df_signals = df_signals.dropna(subset=['future_return', 'signal'])
         
         return df_signals
+    
+    def compute_sample_weights(self, n_samples: int, decay_factor: float = 0.995) -> np.ndarray:
+        """
+        Compute exponential decay sample weights to prioritize recent data.
+        
+        More recent samples get higher weight, so the model adapts
+        to current market conditions rather than being anchored to old patterns.
+        
+        Args:
+            n_samples: Number of training samples
+            decay_factor: Decay rate (0.99 = slow decay, 0.95 = fast decay)
+            
+        Returns:
+            Array of sample weights (most recent = highest weight)
+        """
+        weights = np.array([decay_factor ** (n_samples - 1 - i) for i in range(n_samples)])
+        # Normalize so weights sum to n_samples (preserves effective sample size interpretation)
+        weights = weights * n_samples / weights.sum()
+        return weights
+    
+    def select_features_by_importance(
+        self, X: pd.DataFrame, y: pd.Series, 
+        top_k: int = 30, method: str = 'tree'
+    ) -> List[str]:
+        """
+        Select top-K features using tree-based importance.
+        
+        Reduces noise from irrelevant features which is a major cause
+        of overfitting and poor direction accuracy.
+        
+        Args:
+            X: Feature matrix
+            y: Target variable
+            top_k: Number of top features to keep
+            method: Feature selection method ('tree' or 'mutual_info')
+            
+        Returns:
+            List of selected feature names
+        """
+        if method == 'tree':
+            # Use a simple ExtraTreesClassifier for feature importance
+            selector = ExtraTreesClassifier(
+                n_estimators=100, max_depth=5, random_state=42, n_jobs=-1
+            )
+            selector.fit(X, y)
+            importances = pd.Series(selector.feature_importances_, index=X.columns)
+        else:
+            from sklearn.feature_selection import mutual_info_classif
+            mi_scores = mutual_info_classif(X, y, random_state=42)
+            importances = pd.Series(mi_scores, index=X.columns)
+        
+        # Select top features
+        top_features = importances.nlargest(min(top_k, len(importances))).index.tolist()
+        
+        # Store feature importance for analysis
+        self.feature_importance_scores = importances.sort_values(ascending=False)
+        
+        logger.info(f"Selected {len(top_features)} features from {len(X.columns)} total")
+        logger.info(f"Top 10 features: {top_features[:10]}")
+        
+        return top_features
     
     def add_model(self, name: str, model: Any):
         """Add a custom model to the manager."""
@@ -461,28 +650,54 @@ class ForexMLModelManager:
         X_train: pd.DataFrame, 
         y_train: pd.Series,
         cv_folds: int = 5,
-        use_time_series_cv: bool = True
+        use_time_series_cv: bool = True,
+        use_sample_weights: bool = True,
+        use_feature_selection: bool = True,
+        use_purged_cv: bool = True,
+        calibrate_probabilities: bool = True
     ) -> Dict[str, Dict[str, float]]:
         """
-        Train all models and evaluate using cross-validation.
+        Train all models with enhanced anti-overfitting measures.
+        
+        Key improvements:
+        - Purged time-series CV to prevent data leakage
+        - Sample weighting for recent data emphasis
+        - Feature selection to reduce noise
+        - Probability calibration for reliable confidence
         
         Args:
             X_train: Training features
             y_train: Training target
             cv_folds: Number of CV folds
             use_time_series_cv: Use TimeSeriesSplit for CV
+            use_sample_weights: Apply exponential decay sample weights
+            use_feature_selection: Perform feature selection before training
+            use_purged_cv: Use purged CV with embargo gap
+            calibrate_probabilities: Calibrate probability predictions
             
         Returns:
             Dictionary of model results
         """
         
-        # Setup cross-validation
-        if use_time_series_cv:
+        # Feature selection - reduce noise
+        if use_feature_selection and len(X_train.columns) > 20:
+            selected_features = self.select_features_by_importance(
+                X_train, y_train, top_k=min(35, len(X_train.columns))
+            )
+            X_train = X_train[selected_features]
+            # Update feature columns for prediction
+            self.forex_feature_columns = selected_features
+            logger.info(f"Using {len(selected_features)} selected features for training")
+        
+        # Setup cross-validation with purge gap
+        if use_purged_cv:
+            cv = PurgedTimeSeriesSplit(n_splits=cv_folds, purge_gap=3)
+        elif use_time_series_cv:
             cv = TimeSeriesSplit(n_splits=cv_folds)
         else:
             cv = cv_folds
         
-        # Initialize scaler
+        # Initialize scaler - RobustScaler is less sensitive to outliers
         self.scaler = RobustScaler()
         X_scaled = self.scaler.fit_transform(X_train)
         X_scaled_df = pd.DataFrame(X_scaled, columns=X_train.columns, index=X_train.index)
@@ -494,6 +709,12 @@ class ForexMLModelManager:
         else:
             y_encoded = y_train.values
         
+        # Compute sample weights (prioritize recent data)
+        if use_sample_weights:
+            sample_weights = self.compute_sample_weights(len(y_encoded), decay_factor=0.997)
+        else:
+            sample_weights = None
+        
         results = {}
         
         for name, model in self.models.items():
@@ -501,59 +722,167 @@ class ForexMLModelManager:
                 logger.info(f"Training {name}...")
                 
                 if self.task_type == 'classification':
-                    # Classification metrics
-                    cv_scores = cross_val_score(model, X_scaled, y_encoded, cv=cv, scoring='accuracy')
+                    # Walk-forward validation with purged CV
+                    cv_scores = []
+                    cv_direction_scores = []
                     
-                    # Fit model for additional metrics
-                    model.fit(X_scaled, y_encoded)
+                    for train_idx, val_idx in (cv.split(X_scaled) if hasattr(cv, 'split') else [(None, None)]):
+                        if train_idx is None:
+                            break
+                        
+                        X_cv_train = X_scaled[train_idx]
+                        X_cv_val = X_scaled[val_idx]
+                        y_cv_train = y_encoded[train_idx]
+                        y_cv_val = y_encoded[val_idx]
+                        
+                        # Apply sample weights for training fold
+                        fold_weights = sample_weights[train_idx] if sample_weights is not None else None
+                        
+                        # Fit model with sample weights where supported
+                        if fold_weights is not None and hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                            try:
+                                model.fit(X_cv_train, y_cv_train, sample_weight=fold_weights)
+                            except TypeError:
+                                model.fit(X_cv_train, y_cv_train)
+                        else:
+                            model.fit(X_cv_train, y_cv_train)
+                        
+                        y_pred = model.predict(X_cv_val)
+                        fold_accuracy = accuracy_score(y_cv_val, y_pred)
+                        cv_scores.append(fold_accuracy)
+                    
+                    if not cv_scores:
+                        # Fallback to standard cross_val_score
+                        cv_scores_array = cross_val_score(model, X_scaled, y_encoded, cv=cv_folds, scoring='accuracy')
+                        cv_scores = cv_scores_array.tolist()
+                    
+                    # Final training on full dataset with sample weights
+                    if sample_weights is not None and hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                        try:
+                            model.fit(X_scaled, y_encoded, sample_weight=sample_weights)
+                        except TypeError:
+                            model.fit(X_scaled, y_encoded)
+                    else:
+                        model.fit(X_scaled, y_encoded)
+                    
                     y_pred = model.predict(X_scaled)
                     
+                    # Calibrate probabilities for better confidence estimates
+                    if calibrate_probabilities and hasattr(model, 'predict_proba'):
+                        try:
+                            calibrated_model = CalibratedClassifierCV(
+                                model, cv=TimeSeriesSplit(n_splits=3), method='isotonic'
+                            )
+                            calibrated_model.fit(X_scaled, y_encoded)
+                            # Store calibrated model
+                            self.models[name] = calibrated_model
+                        except Exception as cal_err:
+                            logger.warning(f"Could not calibrate {name}: {cal_err}")
+                    
                     results[name] = {
-                        'cv_accuracy_mean': cv_scores.mean(),
-                        'cv_accuracy_std': cv_scores.std(),
+                        'cv_accuracy_mean': np.mean(cv_scores),
+                        'cv_accuracy_std': np.std(cv_scores),
                         'train_accuracy': accuracy_score(y_encoded, y_pred),
                         'train_precision': precision_score(y_encoded, y_pred, average='weighted', zero_division=0),
                         'train_recall': recall_score(y_encoded, y_pred, average='weighted', zero_division=0),
-                        'train_f1': f1_score(y_encoded, y_pred, average='weighted', zero_division=0)
+                        'train_f1': f1_score(y_encoded, y_pred, average='weighted', zero_division=0),
+                        'cv_scores': cv_scores,
+                        'overfitting_gap': accuracy_score(y_encoded, y_pred) - np.mean(cv_scores)
                     }
                     
                     # Add AUC if binary classification
                     if len(np.unique(y_encoded)) == 2:
                         if hasattr(model, 'predict_proba'):
-                            y_proba = model.predict_proba(X_scaled)[:, 1]
-                            results[name]['train_auc'] = roc_auc_score(y_encoded, y_proba)
+                            try:
+                                y_proba = model.predict_proba(X_scaled)[:, 1]
+                                results[name]['train_auc'] = roc_auc_score(y_encoded, y_proba)
+                            except Exception:
+                                pass
+                    
+                    # Log overfitting warning
+                    gap = results[name]['overfitting_gap']
+                    if gap > 0.15:
+                        logger.warning(f"HIGH OVERFITTING for {name}: train={results[name]['train_accuracy']:.3f}, "
+                                     f"cv={results[name]['cv_accuracy_mean']:.3f}, gap={gap:.3f}")
                 
                 else:
-                    # Regression metrics
-                    cv_scores = cross_val_score(model, X_scaled, y_encoded, cv=cv, scoring='neg_mean_squared_error')
+                    # Regression metrics - walk-forward
+                    cv_scores = []
                     
-                    # Fit model for additional metrics
-                    model.fit(X_scaled, y_encoded)
+                    for train_idx, val_idx in (cv.split(X_scaled) if hasattr(cv, 'split') else [(None, None)]):
+                        if train_idx is None:
+                            break
+                        
+                        X_cv_train = X_scaled[train_idx]
+                        X_cv_val = X_scaled[val_idx]
+                        y_cv_train = y_encoded[train_idx]
+                        y_cv_val = y_encoded[val_idx]
+                        
+                        fold_weights = sample_weights[train_idx] if sample_weights is not None else None
+                        
+                        if fold_weights is not None and hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                            try:
+                                model.fit(X_cv_train, y_cv_train, sample_weight=fold_weights)
+                            except TypeError:
+                                model.fit(X_cv_train, y_cv_train)
+                        else:
+                            model.fit(X_cv_train, y_cv_train)
+                        
+                        y_pred = model.predict(X_cv_val)
+                        fold_mse = mean_squared_error(y_cv_val, y_pred)
+                        cv_scores.append(-fold_mse)
+                    
+                    if not cv_scores:
+                        cv_scores_array = cross_val_score(model, X_scaled, y_encoded, cv=cv_folds, scoring='neg_mean_squared_error')
+                        cv_scores = cv_scores_array.tolist()
+                    
+                    # Final training on full dataset
+                    if sample_weights is not None and hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                        try:
+                            model.fit(X_scaled, y_encoded, sample_weight=sample_weights)
+                        except TypeError:
+                            model.fit(X_scaled, y_encoded)
+                    else:
+                        model.fit(X_scaled, y_encoded)
+                    
                     y_pred = model.predict(X_scaled)
                     
                     results[name] = {
-                        'cv_mse_mean': -cv_scores.mean(),
-                        'cv_mse_std': cv_scores.std(),
+                        'cv_mse_mean': -np.mean(cv_scores),
+                        'cv_mse_std': np.std(cv_scores),
                         'train_mse': mean_squared_error(y_encoded, y_pred),
                         'train_mae': mean_absolute_error(y_encoded, y_pred),
                         'train_r2': r2_score(y_encoded, y_pred)
                     }
                 
-                logger.info(f"✅ {name} trained successfully")
+                logger.info(f"[OK] {name} trained successfully")
                 
             except Exception as e:
-                logger.error(f"❌ Error training {name}: {str(e)}")
+                logger.error(f"[ERROR] Error training {name}: {str(e)}")
                 results[name] = {'error': str(e)}
         
         self.results = results
         
-        # Find best model
+        # Find best model (prefer models with low overfitting)
         self._find_best_model()
+        
+        # Store training metadata
+        self.training_metadata = {
+            'training_date': datetime.now().isoformat(),
+            'n_samples': len(X_train),
+            'n_features': len(X_train.columns),
+            'feature_columns': X_train.columns.tolist(),
+            'used_sample_weights': use_sample_weights,
+            'used_feature_selection': use_feature_selection,
+            'used_purged_cv': use_purged_cv,
+            'cv_folds': cv_folds,
+            'task_type': self.task_type
+        }
         
         return results
     
     def _find_best_model(self):
-        """Find the best performing model based on results."""
+        """Find the best performing model with overfitting penalty."""
         if not self.results:
             return
         
@@ -569,14 +898,23 @@ class ForexMLModelManager:
         
         if valid_results:
             if self.task_type == 'classification':
-                best_name = max(valid_results, key=lambda x: valid_results[x][metric])
+                # Penalize models with high overfitting gap
+                # Score = CV accuracy - 0.5 * overfitting_gap
+                def adjusted_score(name):
+                    cv_acc = valid_results[name][metric]
+                    gap = valid_results[name].get('overfitting_gap', 0)
+                    # Penalize if overfitting gap > 10%
+                    penalty = max(0, gap - 0.10) * 0.5
+                    return cv_acc - penalty
+                
+                best_name = max(valid_results, key=adjusted_score)
             else:
                 best_name = min(valid_results, key=lambda x: valid_results[x][metric])
             
             self.best_model_name = best_name
             self.best_model = self.models[best_name]
             
-            logger.info(f"🎯 Best model: {best_name}")
+            logger.info(f"Best model: {best_name}")
     
     def save_model(self, filepath: str, model_name: Optional[str] = None):
         """Save the best model or specified model to disk."""
@@ -598,11 +936,13 @@ class ForexMLModelManager:
             'task_type': self.task_type,
             'best_model_name': self.best_model_name or model_name,
             'results': self.results,
+            'feature_importance': self.feature_importance_scores,
+            'training_metadata': self.training_metadata,
             'timestamp': datetime.now().isoformat()
         }
         
         joblib.dump(artifacts, filepath)
-        logger.info(f"✅ Model saved to {filepath}")
+        logger.info(f"Model saved to {filepath}")
     
     def load_model(self, filepath: str):
         """Load a saved model from disk."""
@@ -615,11 +955,13 @@ class ForexMLModelManager:
             self.forex_feature_columns = artifacts.get('feature_columns', self.forex_feature_columns)
             self.best_model_name = artifacts.get('best_model_name')
             self.results = artifacts.get('results', {})
+            self.feature_importance_scores = artifacts.get('feature_importance')
+            self.training_metadata = artifacts.get('training_metadata', {})
             
-            logger.info(f"✅ Model loaded from {filepath}")
+            logger.info(f"Model loaded from {filepath}")
             
         except Exception as e:
-            logger.error(f"❌ Error loading model: {e}")
+            logger.error(f"Error loading model: {e}")
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Make predictions using the best model."""
@@ -656,6 +998,52 @@ class ForexMLModelManager:
             X_scaled = X.values
         
         return self.best_model.predict_proba(X_scaled)
+    
+    def get_model_health_report(self) -> Dict[str, Any]:
+        """
+        Generate a model health report to detect drift and staleness.
+        
+        Returns:
+            Dictionary with model health metrics and recommendations
+        """
+        report = {
+            'model_name': self.best_model_name,
+            'training_date': self.training_metadata.get('training_date'),
+            'n_features': self.training_metadata.get('n_features'),
+            'n_samples': self.training_metadata.get('n_samples'),
+            'recommendations': []
+        }
+        
+        if self.results and self.best_model_name:
+            best_results = self.results.get(self.best_model_name, {})
+            cv_acc = best_results.get('cv_accuracy_mean', 0)
+            cv_std = best_results.get('cv_accuracy_std', 0)
+            overfit_gap = best_results.get('overfitting_gap', 0)
+            
+            report['cv_accuracy'] = cv_acc
+            report['cv_std'] = cv_std
+            report['overfitting_gap'] = overfit_gap
+            
+            # Health checks
+            if cv_acc < 0.52:
+                report['recommendations'].append("CV accuracy below 52% - model has no predictive edge. Retrain with more recent data.")
+            if cv_std > 0.10:
+                report['recommendations'].append("High CV variance - model is unstable. Consider simpler models or more data.")
+            if overfit_gap > 0.15:
+                report['recommendations'].append("High overfitting detected. Reduce model complexity or add regularization.")
+            
+            # Check training age
+            training_date = self.training_metadata.get('training_date')
+            if training_date:
+                try:
+                    age_days = (datetime.now() - datetime.fromisoformat(training_date)).days
+                    report['model_age_days'] = age_days
+                    if age_days > 7:
+                        report['recommendations'].append(f"Model is {age_days} days old. Consider retraining for current market conditions.")
+                except Exception:
+                    pass
+        
+        return report
 
 
 # Convenience functions
