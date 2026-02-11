@@ -56,6 +56,13 @@ class ForexResultsExporter:
             model_version VARCHAR(20),
             features_used INT,
             created_at DATETIME DEFAULT GETDATE(),
+            actual_return_1d FLOAT NULL,
+            actual_return_5d FLOAT NULL,
+            actual_return_10d FLOAT NULL,
+            prediction_accuracy VARCHAR(50) NULL,
+            direction_correct_1d BIT NULL,
+            direction_correct_5d BIT NULL,
+            updated_at DATETIME NULL,
             INDEX IX_forex_predictions_pair_date (currency_pair, date_time),
             INDEX IX_forex_predictions_signal (predicted_signal),
             INDEX IX_forex_predictions_created (created_at)
@@ -189,15 +196,20 @@ class ForexResultsExporter:
 
     def drop_prediction_tables(self) -> bool:
         """
-        Drop existing forex prediction tables to start fresh.
+        Clean existing forex prediction data to start fresh.
+        
+        Instead of DROP TABLE on forex_ml_predictions (which destroys outcome tracking
+        columns needed by backfill_strategy1_outcomes.py and vw_strategy2_unified_ml_predictions),
+        we DELETE today's rows to preserve historical backfill data and table schema.
+        Summary and performance tables are safe to drop/recreate.
         
         Returns:
             bool: True if successful, False otherwise
         """
         drop_tables_sql = f"""
-        -- Drop prediction tables if they exist
+        -- Clean today's predictions only (preserve history + backfill columns)
         IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.predictions_table}' AND xtype='U')
-            DROP TABLE {self.predictions_table}
+            DELETE FROM {self.predictions_table} WHERE CAST(prediction_date AS date) = CAST(GETDATE() AS date)
         
         IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.daily_summary_table}' AND xtype='U')
             DROP TABLE {self.daily_summary_table}
@@ -212,7 +224,7 @@ class ForexResultsExporter:
             with engine.connect() as conn:
                 conn.execute(text(drop_tables_sql))
                 conn.commit()
-                logger.info(f"✅ Dropped existing forex prediction tables")
+                logger.info(f"✅ Cleaned forex prediction data (preserved historical backfill)")
                 
             return True
             

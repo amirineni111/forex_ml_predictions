@@ -72,22 +72,40 @@ class ForexDailyAutomation:
         self.results_exporter = ForexResultsExporter(self.db)
         
     def drop_previous_prediction_tables(self):
-        """Drop previous forex prediction tables to start fresh."""
+        """Clean previous forex prediction data for today (preserves historical backfill data).
+        
+        Instead of DROP TABLE (which destroys outcome tracking columns and backfill data),
+        we delete today's rows and drop/recreate only the summary and performance tables.
+        The forex_ml_predictions table schema is preserved so that:
+        - backfill_strategy1_outcomes.py can populate actual_return_* and direction_correct_* columns
+        - vw_strategy2_unified_ml_predictions view stays valid (no binding errors)
+        """
         try:
-            safe_print("[INFO] Dropping previous prediction tables...")
+            safe_print("[INFO] Cleaning previous prediction data...")
             
-            # Tables to drop
+            engine = self.db.get_sqlalchemy_engine()
+            from sqlalchemy import text
+            
+            # For forex_ml_predictions: DELETE today's rows only (preserve history + backfill data)
+            try:
+                with engine.connect() as conn:
+                    result = conn.execute(text(
+                        "DELETE FROM forex_ml_predictions WHERE CAST(prediction_date AS date) = CAST(GETDATE() AS date)"
+                    ))
+                    conn.commit()
+                    safe_print(f"[OK] Cleaned forex_ml_predictions: removed {result.rowcount} rows for today")
+            except Exception as e:
+                # Table might not exist yet on first run -- that's OK, create_results_tables will handle it
+                safe_print(f"[WARN] forex_ml_predictions cleanup: {e}")
+            
+            # For summary and performance tables: safe to drop and recreate (no backfill dependency)
             tables_to_drop = [
-                'forex_ml_predictions',
                 'forex_daily_summary', 
                 'forex_model_performance'
             ]
             
-            engine = self.db.get_sqlalchemy_engine()
-            
             for table in tables_to_drop:
                 try:
-                    from sqlalchemy import text
                     with engine.connect() as conn:
                         conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
                         conn.commit()
@@ -95,11 +113,11 @@ class ForexDailyAutomation:
                 except Exception as e:
                     safe_print(f"[WARN] Table {table} not found or already dropped: {e}")
                     
-            safe_print("[OK] Previous prediction tables dropped successfully")
+            safe_print("[OK] Previous prediction data cleaned successfully")
             return True
             
         except Exception as e:
-            safe_print(f"[ERROR] Error dropping tables: {e}")
+            safe_print(f"[ERROR] Error cleaning prediction data: {e}")
             return False
         
     def check_data_availability(self):
