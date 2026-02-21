@@ -27,5 +27,18 @@ USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY,
 - `sqlserver_copilot_nse` — NSE ML pipeline (5-model ensemble)
 - `stockdata_agenticai` — CrewAI agents (Forex Agent consumes predictions)
 - `streamlit-trading-dashboard` — Visualization
-- `sqlserver_mcp` — .NET MCP bridge
+- `sqlserver_mcp` — .NET 8 MCP Server (Microsoft MssqlMcp) with 7 tools: ListTables, DescribeTable, ReadData, CreateTable, DropTable, InsertData, UpdateData. Stdio transport. Use to explore DB schemas and verify query results during development.
 - `stockanalysis` — Data ingestion ETL
+
+## MCP Server for Development
+Configure in `.vscode/mcp.json` to query stockdata_db directly from your AI IDE:
+```json
+"MSSQL MCP": {
+    "type": "stdio",
+    "command": "C:\\Users\\sreea\\OneDrive\\Desktop\\sqlserver_mcp\\SQL-AI-samples\\MssqlMcp\\dotnet\\MssqlMcp\\bin\\Debug\\net8.0\\MssqlMcp.exe",
+    "env": {
+        "CONNECTION_STRING": "Server=localhost\\MSSQLSERVER01;Database=stockdata_db;Trusted_Connection=True;TrustServerCertificate=True"
+    }
+}
+```
+Useful for: verifying `forex_ml_predictions` output, checking `forex_hist_data` schema, exploring currency pair signal distributions.

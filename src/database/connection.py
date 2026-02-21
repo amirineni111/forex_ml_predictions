@@ -33,15 +33,19 @@ class ForexSQLServerConnection:
     
     def __init__(
         self,
-        server: str = "localhost\\MSSQLSERVER01",
-        database: str = "stockdata_db", 
+        server: Optional[str] = None,
+        database: Optional[str] = None, 
         username: Optional[str] = None,
         password: Optional[str] = None,
-        driver: str = "ODBC Driver 17 for SQL Server",
-        trusted_connection: bool = True
+        driver: Optional[str] = None,
+        trusted_connection: bool = False
     ):
         """
         Initialize the Forex SQL Server connection.
+        
+        Configuration is resolved in order: explicit args > environment variables > defaults.
+        Set SQL_TRUSTED_CONNECTION=yes in .env for Windows auth, or provide
+        SQL_USERNAME/SQL_PASSWORD for SQL Server auth (remote access).
         
         Args:
             server: SQL Server instance name or IP address
@@ -51,12 +55,12 @@ class ForexSQLServerConnection:
             driver: ODBC driver name
             trusted_connection: Use Windows authentication if True
         """
-        self.server = server
-        self.database = database
-        self.username = username
-        self.password = password
-        self.driver = driver
-        self.trusted_connection = trusted_connection
+        self.server = server or os.getenv('SQL_SERVER', 'localhost\\MSSQLSERVER01')
+        self.database = database or os.getenv('SQL_DATABASE', 'stockdata_db')
+        self.username = username or os.getenv('SQL_USERNAME')
+        self.password = password or os.getenv('SQL_PASSWORD')
+        self.driver = driver or os.getenv('SQL_DRIVER', 'ODBC Driver 17 for SQL Server')
+        self.trusted_connection = trusted_connection or os.getenv('SQL_TRUSTED_CONNECTION', '').lower() == 'yes'
         
         self._engine: Optional[Engine] = None
         self.connection = None
