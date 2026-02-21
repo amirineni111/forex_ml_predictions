@@ -1,0 +1,28 @@
+# Cursor Rules — sqlserver_copilot_forex
+
+## Project
+Forex ML training pipeline. Multi-model ensemble for Buy/Sell/Hold predictions on 10 currency pairs.
+
+## Stack
+- Python 3.11+, XGBoost, LightGBM, scikit-learn, pandas, numpy, pyodbc
+- SQL Server (localhost\MSSQLSERVER01, stockdata_db, Windows Auth)
+
+## Architecture
+- feature_engineering.py → 100+ features from OHLCV data
+- ensemble_builder.py → XGBoost, LightGBM, Voting, Stacking models
+- predict_daily.py → Daily predictions → forex_ml_predictions table
+- 3-class classification (Buy/Sell/Hold) — NOT binary
+- Forex prices are DECIMAL (not VARCHAR like equity tables)
+
+## Output Table
+- forex_ml_predictions (currency_pair, date, signal, confidence, probabilities, model_name, model_version)
+
+## 10 Currency Pairs
+USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY, GBP/JPY
+
+## Schedule
+- 7:00 AM daily predictions
+- Sunday 6:00 AM weekly retrain
+
+## Ecosystem
+Part of 7-repo trading platform. Predictions consumed by stockdata_agenticai (Forex Agent) and streamlit-trading-dashboard.

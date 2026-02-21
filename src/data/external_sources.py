@@ -10,11 +10,24 @@ from typing import Dict, List, Optional
 import requests
 from datetime import datetime, timedelta
 
+# Optional: pyodbc for reading from shared market_context_daily table
+try:
+    import pyodbc
+    _HAS_PYODBC = True
+except ImportError:
+    _HAS_PYODBC = False
+
 class ExternalDataSources:
     """Collect external data that impacts forex movements"""
     
-    def __init__(self):
+    def __init__(self, use_db=True):
+        """
+        Args:
+            use_db: If True, read market sentiment from shared market_context_daily table
+                    in SQL Server (faster, no rate limits). Falls back to yfinance if unavailable.
+        """
         self.data_cache = {}
+        self.use_db = use_db and _HAS_PYODBC
     
     def get_economic_indicators(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -48,16 +61,77 @@ class ExternalDataSources:
     
     def get_market_sentiment_data(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        Get market sentiment indicators
+        Get market sentiment indicators from shared DB table or yfinance fallback.
         
-        Key sentiment data:
-        1. VIX (Fear Index)
-        2. USD Index (DXY)
-        3. Gold prices (Safe haven)
-        4. 10Y Treasury yields
-        5. Credit spreads
-        6. Carry trade indices
+        When use_db=True, reads from market_context_daily table which has:
+        VIX, DXY, S&P 500, NASDAQ, US 10Y yield - all pre-computed with returns.
+        This is faster and avoids yfinance rate limits during training.
         """
+        
+        # Try reading from shared database table first
+        if self.use_db:
+            try:
+                return self._get_sentiment_from_db(start_date, end_date)
+            except Exception as e:
+                print(f"[WARN] Could not read market context from DB: {e}")
+                print("[INFO] Falling back to yfinance download...")
+        
+        return self._get_sentiment_from_yfinance(start_date, end_date)
+    
+    def _get_sentiment_from_db(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Read market sentiment data from shared market_context_daily table."""
+        conn = pyodbc.connect(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            "SERVER=localhost\\MSSQLSERVER01;"
+            "DATABASE=stockdata_db;"
+            "Trusted_Connection=yes;"
+        )
+        
+        query = f"""
+        SELECT trading_date,
+               vix_close, vix_change_pct,
+               sp500_close, sp500_return_1d,
+               nasdaq_comp_close, nasdaq_comp_return_1d,
+               dxy_close, dxy_return_1d,
+               us_10y_yield_close, us_10y_yield_change
+        FROM dbo.market_context_daily
+        WHERE trading_date >= '{start_date}' AND trading_date <= '{end_date}'
+        ORDER BY trading_date
+        """
+        
+        df = pd.read_sql(query, conn, parse_dates=['trading_date'])
+        conn.close()
+        
+        if df.empty:
+            raise ValueError("No data in market_context_daily for date range")
+        
+        # Rename columns to match existing forex feature naming convention
+        rename_map = {
+            'vix_close': 'vix_close',
+            'vix_change_pct': 'vix_return_1d',
+            'sp500_close': 'spx_close',
+            'sp500_return_1d': 'spx_return_1d',
+            'dxy_close': 'dxy_close',
+            'dxy_return_1d': 'dxy_return_1d',
+            'us_10y_yield_close': 'us_10y_close',
+            'us_10y_yield_change': 'us_10y_return_1d',
+        }
+        df = df.rename(columns=rename_map)
+        
+        # Compute rolling volatility features (same as yfinance path)
+        for col in ['vix', 'spx', 'dxy', 'us_10y']:
+            close_col = f'{col}_close'
+            if close_col in df.columns:
+                df[f'{col}_return_5d'] = df[close_col].pct_change(5)
+                df[f'{col}_volatility'] = df[close_col].pct_change().rolling(20).std()
+                df[f'{col}_volume'] = 0  # No volume from DB — set to 0 for compatibility
+        
+        df = df.set_index('trading_date')
+        print(f"  [OK] Market context from DB: {len(df)} rows ({start_date} to {end_date})")
+        return df
+    
+    def _get_sentiment_from_yfinance(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Original yfinance download path (fallback)."""
         
         sentiment_tickers = {
             'vix': '^VIX',          # Fear index
