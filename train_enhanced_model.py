@@ -94,6 +94,9 @@ class EnhancedForexTrainer:
                 # Add advanced features
                 enhanced_data = self.feature_engineer.create_advanced_features(base_data)
                 
+                # Add calendar features (holidays, short weeks, bank holidays)
+                enhanced_data = self._merge_calendar_features(enhanced_data)
+                
                 # Add external market data (sentiment, economic indicators)
                 enhanced_data = self._add_external_features(enhanced_data, pair)
                 
@@ -142,6 +145,38 @@ class EnhancedForexTrainer:
                     return df_with_sentiment
         except Exception as e:
             logger.warning(f"Error adding external features for {currency_pair}: {e}")
+        
+        return df
+    
+    def _merge_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Load calendar features (bank holidays, short weeks) and merge on date.
+        
+        Adds pre/post holiday flags, short week indicators, and cross-market
+        holiday awareness from the shared market_calendar table.
+        Forex uses 'date_time' column (aliased from trading_date in SQL).
+        """
+        try:
+            cal_query = """
+            SELECT calendar_date,
+                   is_pre_holiday, is_post_holiday, is_short_week,
+                   trading_days_in_week, is_quarter_end, is_options_expiry,
+                   days_until_next_holiday, days_since_last_holiday,
+                   other_market_closed
+            FROM dbo.vw_market_calendar_features
+            WHERE market = 'FOREX'
+            """
+            df_cal = pd.read_sql(cal_query, self.db.get_sqlalchemy_engine())
+            
+            if not df_cal.empty:
+                df['date_time'] = pd.to_datetime(df['date_time'])
+                df_cal['calendar_date'] = pd.to_datetime(df_cal['calendar_date'])
+                # Normalize date_time to date-only for matching against calendar_date
+                df['_cal_date'] = df['date_time'].dt.normalize()
+                df = df.merge(df_cal, left_on='_cal_date', right_on='calendar_date', how='left')
+                df = df.drop(columns=['calendar_date', '_cal_date'], errors='ignore')
+                logger.info(f"Calendar features merged: {len(df_cal)} dates")
+        except Exception as e:
+            logger.warning(f"Could not load calendar features: {e}")
         
         return df
     
