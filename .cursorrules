@@ -5,7 +5,7 @@ Forex ML training pipeline. Multi-model ensemble for Buy/Sell/Hold predictions o
 
 ## Stack
 - Python 3.11+, XGBoost, LightGBM, scikit-learn, pandas, numpy, pyodbc
-- SQL Server (localhost\MSSQLSERVER01, stockdata_db, Windows Auth)
+- SQL Server (192.168.86.55\MSSQLSERVER01, stockdata_db, SQL Auth)
 
 ## Architecture
 - feature_engineering.py → 100+ features from OHLCV data
@@ -34,7 +34,7 @@ Part of 7-repo trading platform. Predictions consumed by stockdata_agenticai (Fo
     "type": "stdio",
     "command": "C:\\Users\\sreea\\OneDrive\\Desktop\\sqlserver_mcp\\SQL-AI-samples\\MssqlMcp\\dotnet\\MssqlMcp\\bin\\Debug\\net8.0\\MssqlMcp.exe",
     "env": {
-        "CONNECTION_STRING": "Server=localhost\\MSSQLSERVER01;Database=stockdata_db;Trusted_Connection=True;TrustServerCertificate=True"
+        "CONNECTION_STRING": "Server=192.168.86.55\\MSSQLSERVER01;Database=stockdata_db;User Id=remote_user;Password=YourStrongPassword123!;TrustServerCertificate=True"
     }
 }
 ```

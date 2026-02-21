@@ -82,7 +82,7 @@ class ExternalDataSources:
         """Read market sentiment data from shared market_context_daily table."""
         conn = pyodbc.connect(
             "DRIVER={ODBC Driver 17 for SQL Server};"
-            "SERVER=localhost\\MSSQLSERVER01;"
+            "SERVER=192.168.86.55\\MSSQLSERVER01;"
             "DATABASE=stockdata_db;"
             "Trusted_Connection=yes;"
         )
