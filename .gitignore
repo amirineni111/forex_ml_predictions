@@ -35,9 +35,10 @@ MANIFEST
 .env.production.local
 
 # ML Models and Data
-data/models/*.joblib
-data/models/*.pkl
-data/models/*.model
+*.joblib
+*.pkl
+*.model
+data/models/
 data/processed/
 data/raw/
 *.h5
