@@ -3,6 +3,11 @@ echo ===============================================
 echo    Forex ML Automation with Signal Strength  
 echo ===============================================
 echo.
+
+REM Set working directory and activate virtual environment
+cd /d "C:\Users\sreea\OneDrive\Desktop\sqlserver_copilot_forex"
+call .venv\Scripts\activate.bat
+
 echo Select automation option:
 echo 1. Run Daily Predictions (All Currency Pairs)
 echo 2. Retrain Enhanced Model (Weekly Task)  
