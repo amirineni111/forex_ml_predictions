@@ -203,26 +203,20 @@ class ForexSQLServerConnection:
                 ISNULL(macd.MACD, 0) as macd,
                 ISNULL(macd.Signal_Line, 0) as macd_signal,
                 ISNULL(macd.MACD_Signal, 'Neutral') as macd_signal_strength,
-                ISNULL(macd_signals.MACD_Signal, 'Neutral') as macd_trade_signal,
+                ISNULL(macd_signals.macd_trade_signal, 'Neutral') as macd_trade_signal,
                 
-                -- EMA/SMA indicators with signal flags
-                ISNULL(ema.SMA_200, h.close_price) as sma_200,
-                ISNULL(ema.SMA_100, h.close_price) as sma_100,
+                -- EMA/SMA indicators (SMA_200/SMA_100 replaced by EMA_200/EMA_100 — view rebuilt March 2026)
+                ISNULL(ema.EMA_200, h.close_price) as sma_200,
+                ISNULL(ema.EMA_100, h.close_price) as sma_100,
                 ISNULL(ema.SMA_50, h.close_price) as sma_50,
                 ISNULL(ema.SMA_20, h.close_price) as sma_20,
                 ISNULL(ema.EMA_200, h.close_price) as ema_200,
                 ISNULL(ema.EMA_100, h.close_price) as ema_100,
                 ISNULL(ema.EMA_50, h.close_price) as ema_50,
                 ISNULL(ema.EMA_20, h.close_price) as ema_20,
-                -- SMA/EMA signal strength flags
-                ISNULL(ema.SMA_200_Flag, 'Neutral') as sma_200_signal,
-                ISNULL(ema.SMA_100_Flag, 'Neutral') as sma_100_signal,
-                ISNULL(ema.SMA_50_Flag, 'Neutral') as sma_50_signal,
-                ISNULL(ema.SMA_20_Flag, 'Neutral') as sma_20_signal,
-                ISNULL(ema.EMA_200_Flag, 'Neutral') as ema_200_signal,
-                ISNULL(ema.EMA_100_Flag, 'Neutral') as ema_100_signal,
-                ISNULL(ema.EMA_50_Flag, 'Neutral') as ema_50_signal,
-                ISNULL(ema.EMA_20_Flag, 'Neutral') as ema_20_signal,
+                -- SMA/EMA signal flags replaced by Trend_Status + SMA_Cross_Status
+                ISNULL(ema.Trend_Status, 'NEUTRAL') as trend_status,
+                ISNULL(ema.SMA_Cross_Status, 'NEUTRAL') as sma_cross_status,
                 ISNULL(sma_signals.sma_trade_signal, 'Neutral') as sma_trade_signal,
                 
                 -- Bollinger Bands with signal strength

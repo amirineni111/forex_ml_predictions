@@ -107,8 +107,7 @@ class ForexTradingSignalPredictor:
             'bb_upper', 'bb_middle', 'bb_lower', 'bb_width', 'bb_percent',
             # Signal Strength Features
             'rsi_signal_strength', 'macd_signal_strength', 'macd_trade_signal',
-            'sma_200_signal', 'sma_100_signal', 'sma_50_signal', 'sma_20_signal',
-            'ema_200_signal', 'ema_100_signal', 'ema_50_signal', 'ema_20_signal',
+            'trend_status', 'sma_cross_status',
             'sma_trade_signal', 'bb_signal_strength', 'atr_signal_strength',
             # Derived features
             'daily_return', 'volatility', 'price_range', 'gap', 'volume_ratio',
@@ -123,8 +122,7 @@ class ForexTradingSignalPredictor:
             'combined_signal_strength', 'bullish_signal_count', 'bearish_signal_count', 'signal_agreement',
             # Encoded signal features
             'rsi_signal_strength_encoded', 'macd_signal_strength_encoded', 'macd_trade_signal_encoded',
-            'sma_200_signal_encoded', 'sma_100_signal_encoded', 'sma_50_signal_encoded', 'sma_20_signal_encoded',
-            'ema_200_signal_encoded', 'ema_100_signal_encoded', 'ema_50_signal_encoded', 'ema_20_signal_encoded',
+            'trend_status_encoded', 'sma_cross_status_encoded',
             'sma_trade_signal_encoded', 'bb_signal_strength_encoded', 'atr_signal_strength_encoded'
         ]
     

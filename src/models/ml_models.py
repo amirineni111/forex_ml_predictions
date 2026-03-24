@@ -149,8 +149,7 @@ class ForexMLModelManager:
             
             # Signal Strength Features (encoded as numeric)
             'rsi_signal_strength_encoded', 'macd_signal_strength_encoded', 'macd_trade_signal_encoded',
-            'sma_200_signal_encoded', 'sma_100_signal_encoded', 'sma_50_signal_encoded', 'sma_20_signal_encoded',
-            'ema_200_signal_encoded', 'ema_100_signal_encoded', 'ema_50_signal_encoded', 'ema_20_signal_encoded',
+            'trend_status_encoded', 'sma_cross_status_encoded',
             'sma_trade_signal_encoded', 'bb_signal_strength_encoded', 'atr_signal_strength_encoded',
             
             # Derived features
@@ -392,15 +391,9 @@ class ForexMLModelManager:
             'rsi_signal_strength': {'Overbought (Sell)': -1, 'Oversold (Buy)': 1, 'Neutral': 0},
             'macd_signal_strength': {'Bullish Crossover': 1, 'Bearish Crossover': -1, 'Neutral': 0, 'No Signal': 0},
             'macd_trade_signal': {'Buy': 1, 'Sell': -1, 'Hold': 0, 'Neutral': 0, 'No Signal': 0, 'Bullish Crossover': 1, 'Bearish Crossover': -1},
-            'sma_200_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'sma_100_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'sma_50_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'sma_20_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'ema_200_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'ema_100_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'ema_50_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'ema_20_signal': {'Above': 1, 'Below': -1, 'Neutral': 0},
-            'sma_trade_signal': {'Buy': 1, 'Sell': -1, 'Hold': 0, 'Neutral': 0},
+            'trend_status': {'STRONG_UPTREND': 2, 'UPTREND': 1, 'NEUTRAL': 0, 'DOWNTREND': -1, 'STRONG_DOWNTREND': -2},
+            'sma_cross_status': {'GOLDEN_CROSS_ZONE': 1, 'NEUTRAL': 0, 'DEATH_CROSS_ZONE': -1},
+            'sma_trade_signal': {'Golden Cross': 1, 'Death Cross': -1, 'None': 0, 'Neutral': 0},
             'bb_signal_strength': {'Overbought (Sell)': -1, 'Oversold (Buy)': 1, 'Neutral': 0},
             'atr_signal_strength': {'High Volatility': 1, 'Low Volatility': -1, 'Normal': 0}
         }
