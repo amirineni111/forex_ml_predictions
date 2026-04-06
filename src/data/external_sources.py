@@ -3,12 +3,16 @@ Additional Data Sources for Forex ML Models
 These data sources can significantly boost prediction accuracy
 """
 
+import os
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from typing import Dict, List, Optional
 import requests
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Optional: pyodbc for reading from shared market_context_daily table
 try:
@@ -80,14 +84,32 @@ class ExternalDataSources:
     
     def _get_sentiment_from_db(self, start_date: str, end_date: str) -> pd.DataFrame:
         """Read market sentiment data from shared market_context_daily table."""
-        conn = pyodbc.connect(
-            "DRIVER={ODBC Driver 17 for SQL Server};"
-            "SERVER=192.168.86.55\\MSSQLSERVER01;"
-            "DATABASE=stockdata_db;"
-            "Trusted_Connection=yes;"
-        )
+        server = os.getenv('SQL_SERVER', '192.168.86.28,1444')
+        database = os.getenv('SQL_DATABASE', 'stockdata_db')
+        driver = os.getenv('SQL_DRIVER', 'ODBC Driver 17 for SQL Server')
+        username = os.getenv('SQL_USERNAME', '')
+        password = os.getenv('SQL_PASSWORD', '')
+        trusted = os.getenv('SQL_TRUSTED_CONNECTION', 'no').lower() == 'yes'
+
+        if trusted:
+            conn_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={server};"
+                f"DATABASE={database};"
+                f"Trusted_Connection=yes;"
+            )
+        else:
+            conn_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={server};"
+                f"DATABASE={database};"
+                f"UID={username};"
+                f"PWD={password};"
+            )
+
+        conn = pyodbc.connect(conn_str)
         
-        query = f"""
+        query = """
         SELECT trading_date,
                vix_close, vix_change_pct,
                sp500_close, sp500_return_1d,
@@ -95,11 +117,11 @@ class ExternalDataSources:
                dxy_close, dxy_return_1d,
                us_10y_yield_close, us_10y_yield_change
         FROM dbo.market_context_daily
-        WHERE trading_date >= '{start_date}' AND trading_date <= '{end_date}'
+        WHERE trading_date >= ? AND trading_date <= ?
         ORDER BY trading_date
         """
         
-        df = pd.read_sql(query, conn, parse_dates=['trading_date'])
+        df = pd.read_sql(query, conn, params=[start_date, end_date], parse_dates=['trading_date'])
         conn.close()
         
         if df.empty:
