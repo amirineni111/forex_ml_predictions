@@ -553,7 +553,7 @@ class ForexDailyAutomation:
                 
                 success = main_predictor.train_model(
                     combined_data, 
-                    signal_type='direction',  # Binary direction for better accuracy
+                    signal_type='trend',  # Adaptive volatility-based thresholds to fix SELL bias
                     future_periods=1           # 1-day ahead
                 )
                 

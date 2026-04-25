@@ -29,8 +29,8 @@ Trains a **multi-model ensemble** (XGBoost, LightGBM, VotingClassifier, Stacking
 
 ### Daily Schedule (Windows Task Scheduler)
 ```
-07:00 AM  Daily prediction run     → forex_ml_predictions
-Sunday 6 AM  Weekly full retrain   → Updated model files
+7:50 PM ET   Daily prediction run     → forex_ml_predictions
+Sunday 10 AM Weekly full retrain     → Updated model files
 ```
 
 ### Key Files

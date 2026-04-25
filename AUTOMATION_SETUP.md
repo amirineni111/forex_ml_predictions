@@ -7,13 +7,13 @@
 ### Timing Options:
 
 #### Option A: Fixed Schedule with Delay (Current Setup)
-- **Data Loading Job**: Runs at your preferred time (e.g., 6:30 AM)
-- **Forex Predictions**: Scheduled at 7:00 AM with 5-minute delay
+- **Data Loading Job**: Runs at your preferred time (e.g., 7:45 PM ET)
+- **Forex Predictions**: Scheduled at 7:50 PM ET with 5-minute delay
 - The prediction script waits 5 minutes to ensure data loading completes
 
 #### Option B: Sequential Scheduling (Recommended)
-- **Data Loading Job**: 6:30 AM  
-- **Forex Predictions**: 7:05 AM (immediate execution)
+- **Data Loading Job**: 7:45 PM ET  
+- **Forex Predictions**: 7:50 PM ET (immediate execution)
 - Use `run_daily_predictions_immediate.bat` instead
 
 ### Batch File Options:
@@ -24,8 +24,8 @@
 This guide helps you set up automated scheduling for your forex ML trading system using Windows Task Scheduler.
 
 ## 📅 Automation Schedule
-- **Daily Predictions**: Every day at 7:00 AM
-- **Weekly Retraining**: Every Sunday at 6:00 AM
+- **Daily Predictions**: Every day at 7:50 PM ET
+- **Weekly Retraining**: Every Sunday at 10:00 AM
 
 ## 🚀 Quick Setup (Recommended)
 
@@ -47,13 +47,13 @@ This guide helps you set up automated scheduling for your forex ML trading syste
 
 #### Daily Predictions Task:
 - **Name**: Forex Daily Predictions
-- **Trigger**: Daily at 7:00 AM
+- **Trigger**: Daily at 7:50 PM ET
 - **Action**: Start a program
 - **Program**: `C:\Users\sreea\OneDrive\Desktop\sqlserver_copilot_forex\scripts\run_daily_predictions.bat`
 
 #### Weekly Retraining Task:
 - **Name**: Forex Weekly Retraining
-- **Trigger**: Weekly on Sunday at 6:00 AM
+- **Trigger**: Weekly on Sunday at 10:00 AM
 - **Action**: Start a program
 - **Program**: `C:\Users\sreea\OneDrive\Desktop\sqlserver_copilot_forex\scripts\run_weekly_retraining.bat`
 
@@ -75,7 +75,7 @@ Get-ScheduledTask -TaskName "Forex*" | Format-Table TaskName, State
 
 ## 📊 What Each Mode Does
 
-### 1. Daily Predictions Mode (7:00 AM)
+### 1. Daily Predictions Mode (7:50 PM ET)
 - Processes 10 currency pairs
 - Generates 50 trading signals per pair
 - Exports to SQL Server database tables:
@@ -84,7 +84,7 @@ Get-ScheduledTask -TaskName "Forex*" | Format-Table TaskName, State
 - Creates CSV backup reports
 - Takes ~3-5 minutes to complete
 
-### 2. Weekly Retraining Mode (Sunday 6:00 AM)
+### 2. Weekly Retraining Mode (Sunday 10:00 AM)
 - Downloads fresh forex data
 - Retrains ML models with new data
 - Updates model performance metrics

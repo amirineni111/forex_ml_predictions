@@ -27,8 +27,8 @@ if "%choice%"=="1" (
 ) else if "%choice%"=="3" (
     echo.
     echo Starting scheduled automation service...
-    echo Daily predictions: 7:00 AM
-    echo Weekly retraining: Sunday 6:00 AM
+    echo Daily predictions: 7:50 PM ET
+    echo Weekly retraining: Sunday 10:00 AM
     echo Press Ctrl+C to stop
     python daily_forex_automation.py
 ) else if "%choice%"=="4" (

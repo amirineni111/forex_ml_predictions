@@ -16,8 +16,8 @@ This is the **Forex ML training pipeline** — part of a 7-repo stock trading an
 3. `predict_daily.py` — Daily predictions → forex_ml_predictions table
 
 ## Schedule
-- Daily 7:00 AM: Forex prediction run
-- Sunday 6:00 AM: Weekly full retrain
+- Daily 7:50 PM ET: Forex prediction run
+- Sunday 10:00 AM: Weekly full retrain
 
 ## Currency Pairs (10)
 USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY, GBP/JPY

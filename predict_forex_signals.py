@@ -304,12 +304,12 @@ class ForexTradingSignalPredictor:
             safe_print(f"[ERROR] Error preparing features: {e}")
             return df, []
     
-    def train_model(self, df, signal_type='direction', future_periods=1):
+    def train_model(self, df, signal_type='trend', future_periods=1):
         """
         Train a new forex prediction model.
         
         Enhanced with:
-        - Default to 'direction' signal type for binary UP/DOWN
+        - Default to 'trend' signal type for adaptive volatility-based thresholds
         - Default to 1-day ahead prediction
         - Feature selection
         - Sample weighting
@@ -441,7 +441,7 @@ class ForexTradingSignalPredictor:
                 safe_print("[ERROR] Cannot train model: no data available")
                 return pd.DataFrame()
             
-            if not self.train_model(df, signal_type='direction', future_periods=1):
+            if not self.train_model(df, signal_type='trend', future_periods=1):
                 safe_print("[ERROR] Model training failed")
                 return pd.DataFrame()
         
@@ -591,9 +591,9 @@ def main():
     parser.add_argument('--train-new', action='store_true', help='Train a new model')
     parser.add_argument('--export-db', action='store_true', help='Export predictions to SQL Server database')
     parser.add_argument('--setup-tables', action='store_true', help='Setup database tables for results storage')
-    parser.add_argument('--signal-type', type=str, default='direction', 
+    parser.add_argument('--signal-type', type=str, default='trend', 
                        choices=['trend', 'momentum', 'mean_reversion', 'direction'],
-                       help='Type of trading signal (direction recommended)')
+                       help='Type of trading signal (trend recommended for balanced signals)')
     parser.add_argument('--future-periods', type=int, default=1,
                        help='Prediction horizon in days (1 recommended)')
     

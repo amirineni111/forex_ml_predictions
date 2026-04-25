@@ -269,13 +269,13 @@ class EnhancedForexTrainer:
         safe_print("")
     
     def train_enhanced_models(self, test_size: float = 0.2, 
-                             use_binary_direction: bool = True) -> dict:
+                             use_binary_direction: bool = False) -> dict:
         """
         Train enhanced models with all improvements.
         
         Args:
             test_size: Fraction of data for testing
-            use_binary_direction: If True, use UP/DOWN binary prediction (recommended)
+            use_binary_direction: If False, use 3-class BUY/SELL/HOLD prediction (recommended to fix SELL bias)
         
         Key improvements:
         - Binary direction prediction for better accuracy
@@ -664,7 +664,7 @@ def main():
     """Main training function."""
     
     safe_print("=" * 70)
-    safe_print("  ENHANCED FOREX ML TRAINING - Direction Accuracy Optimizer")
+    safe_print("  ENHANCED FOREX ML TRAINING - 3-Class Signal Optimizer")
     safe_print("=" * 70)
     safe_print("")
     
@@ -685,11 +685,11 @@ def main():
         
         enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=800)
         
-        # Train enhanced models with BINARY direction prediction
+        # Train enhanced models with 3-CLASS prediction (BUY/SELL/HOLD)
         safe_print("\n" + "=" * 70)
-        safe_print("  TRAINING WITH BINARY DIRECTION (UP/DOWN)")
+        safe_print("  TRAINING WITH 3-CLASS SIGNALS (BUY/SELL/HOLD)")
         safe_print("=" * 70)
-        results = trainer.train_enhanced_models(test_size=0.2, use_binary_direction=True)
+        results = trainer.train_enhanced_models(test_size=0.2, use_binary_direction=False)
         
         if not results:
             safe_print("[ERROR] Training produced no results")

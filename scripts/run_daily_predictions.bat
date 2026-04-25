@@ -1,5 +1,5 @@
 @echo off
-REM Forex Daily Predictions - Run Mon-Fri at 6:15 PM (after 6 PM data arrival)
+REM Forex Daily Predictions - Run daily at 7:50 PM ET
 
 cd /d "C:\Users\sreea\OneDrive\Desktop\sqlserver_copilot_forex"
 
