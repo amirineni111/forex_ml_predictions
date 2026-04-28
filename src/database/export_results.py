@@ -594,13 +594,15 @@ class ForexResultsExporter:
             logger.error(f"❌ Error exporting prediction features: {e}")
             return False
     
-    def export_daily_summary(self, predictions_df: pd.DataFrame, model_name: str = 'forex_ml_model') -> bool:
+    def export_daily_summary(self, predictions_df: pd.DataFrame, model_name: str = 'forex_ml_model',
+                           model_version: str = '1.0') -> bool:
         """
         Export daily summary statistics to SQL Server.
         
         Args:
             predictions_df: DataFrame with prediction results
             model_name: Name of the model used
+            model_version: Version of the model (optional, stored if table has column)
             
         Returns:
             True if successful, False otherwise

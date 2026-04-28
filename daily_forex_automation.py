@@ -383,9 +383,14 @@ class ForexDailyAutomation:
                 # Export to database
                 safe_print("[DATA] Exporting predictions to SQL Server...")
                 self.results_exporter.create_results_tables()
+                
+                # Get model version from first prediction (all should be same)
+                model_version = combined_predictions['model_version'].iloc[0] if 'model_version' in combined_predictions.columns else '1.0'
+                
                 db_success = self.results_exporter.export_predictions(
                     combined_predictions, 
-                    model_name='daily_automation_model'
+                    model_name='daily_automation_model',
+                    model_version=model_version
                 )
                 
                 # Export feature values
@@ -403,7 +408,8 @@ class ForexDailyAutomation:
                 if db_success:
                     self.results_exporter.export_daily_summary(
                         combined_predictions,
-                        model_name='daily_automation_model'
+                        model_name='daily_automation_model',
+                        model_version=model_version
                     )
                     safe_print("[OK] Predictions exported to database")
                 
@@ -471,10 +477,10 @@ class ForexDailyAutomation:
                 # Prepare enhanced dataset
                 enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=800)
                 
-                # Train with binary direction prediction (UP/DOWN)
+                # Train with 3-class prediction (BUY/SELL/HOLD) using trend signal type
                 results = trainer.train_enhanced_models(
                     test_size=0.2, 
-                    use_binary_direction=True
+                    use_binary_direction=False
                 )
                 
                 if results:

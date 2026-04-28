@@ -15,7 +15,8 @@ import sys
 import os
 
 
-def create_forward_prediction(df_recent, predictions, probabilities, currency_pair):
+def create_forward_prediction(df_recent, predictions, probabilities, currency_pair, 
+                            model_name='enhanced_forex_model', model_version='3.0'):
     """
     Create forward-looking prediction for next trading day.
     
@@ -24,6 +25,8 @@ def create_forward_prediction(df_recent, predictions, probabilities, currency_pa
         predictions: Model predictions 
         probabilities: Prediction probabilities
         currency_pair: Currency pair symbol
+        model_name: Name of the model used
+        model_version: Version of the model used
     
     Returns:
         DataFrame with tomorrow's prediction
@@ -72,8 +75,8 @@ def create_forward_prediction(df_recent, predictions, probabilities, currency_pa
         'volume': df_recent['volume'].iloc[0] if 'volume' in df_recent.columns else 0,
         'predicted_signal': predicted_signal,
         'signal_confidence': 0.0,
-        'model_name': 'enhanced_forex_model',
-        'model_version': '3.0',
+        'model_name': model_name,
+        'model_version': model_version,
         'features_used': 'technical_indicators_enhanced'
     }
     
@@ -160,8 +163,13 @@ def predict_next_day_signals(predictor, currency_pair):
             probabilities = None
         
         # Create forward-looking prediction record
+        # Get model info from predictor
+        model_name = getattr(predictor.model_manager, 'best_model_name', 'enhanced_forex_model')
+        model_version = getattr(predictor, 'model_version', '3.0')
+        
         prediction_df = create_forward_prediction(
-            df_today, predictions, probabilities, currency_pair
+            df_today, predictions, probabilities, currency_pair,
+            model_name=model_name, model_version=model_version
         )
         
         signal = prediction_df['predicted_signal'].iloc[0]
