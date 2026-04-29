@@ -396,17 +396,20 @@ class EnhancedForexTrainer:
     def _select_feature_columns(self) -> list:
         """Select relevant feature columns for training."""
         
-        # Exclude non-feature columns (including future-looking data!)
+        # Exclude non-feature columns (including future-looking data AND target leakage!)
         exclude_columns = [
             'currency_pair', 'date_time', 'target_signal', 'target_direction',
+            'target_signal_encoded', 'target_direction_encoded',  # Prevent target leakage
             'future_return_1d', 'future_return_3d', 'future_return_5d',
             'signal', 'future_return'  # Any target-related columns
         ]
         
         # Also exclude any column with 'signal' in the name (except encoded ones)
+        # Also exclude any column starting with 'target_' to catch any encoded variants
         feature_columns = [
             col for col in self.enhanced_features_df.columns 
             if col not in exclude_columns 
+            and not col.startswith('target_')  # Prevent ANY target_* leakage
             and not (col.endswith('_signal') and not col.endswith('_encoded'))
         ]
         

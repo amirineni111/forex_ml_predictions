@@ -271,8 +271,16 @@ class ForexTradingSignalPredictor:
             if self.model_manager is None:
                 self.model_manager = ForexMLModelManager(task_type='classification')
             
-            # Prepare forex-specific features
-            df_features = self.model_manager.prepare_forex_features(df)
+            # Apply advanced feature engineering (same as training path)
+            try:
+                from features.advanced_features import AdvancedForexFeatures
+            except ImportError:
+                from src.features.advanced_features import AdvancedForexFeatures
+            feature_engineer = AdvancedForexFeatures()
+            df_features = feature_engineer.create_advanced_features(df)
+            
+            # Prepare forex-specific features (adds signal encodings, MAs, etc.)
+            df_features = self.model_manager.prepare_forex_features(df_features)
             
             # Merge calendar features (holidays, short weeks, bank holidays)
             df_features = self._merge_calendar_features(df_features)
