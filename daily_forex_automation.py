@@ -349,7 +349,20 @@ class ForexDailyAutomation:
                     df_recent = df_features.dropna(subset=available_features).tail(1)
                     
                     if not df_recent.empty:
-                        feature_record = df_recent[available_features + ['currency_pair']].copy()
+                        # Collect raw TA columns (OHLCV + SMA/EMA/RSI/MACD/BB/ATR) for
+                        # forex_prediction_features table — NOT the ML model feature subset,
+                        # which uses different column names (e.g. rsi_14 instead of rsi)
+                        # and omits OHLCV entirely.
+                        ta_columns = [
+                            'open_price', 'high_price', 'low_price', 'close_price', 'volume',
+                            'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
+                            'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_200',
+                            'rsi', 'rsi_14', 'macd', 'macd_signal', 'macd_histogram', 'atr', 'atr_14',
+                            'bb_upper', 'bb_middle', 'bb_lower', 'bb_width', 'bb_percent',
+                            'daily_return', 'gap', 'volume_ratio', 'currency_pair',
+                        ]
+                        ta_cols_present = [c for c in ta_columns if c in df_recent.columns]
+                        feature_record = df_recent[ta_cols_present].copy()
                         all_features.append(feature_record)
                     
                     # Generate FORWARD-LOOKING prediction for next trading day

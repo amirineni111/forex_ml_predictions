@@ -53,7 +53,7 @@ class ForexResultsExporter:
             prob_sell DECIMAL(5,3),
             prob_hold DECIMAL(5,3),
             model_name VARCHAR(50),
-            model_version VARCHAR(20),
+            model_version VARCHAR(50),
             features_used INT,
             created_at DATETIME DEFAULT GETDATE(),
             actual_return_1d FLOAT NULL,
@@ -384,71 +384,6 @@ class ForexResultsExporter:
             logger.error(f"❌ Error exporting daily summary: {e}")
             return False
     
-    def export_prediction_features(self, features_df: pd.DataFrame, predictions_df: pd.DataFrame) -> bool:
-        """
-        Export prediction feature values to the features table for analysis.
-        
-        Args:
-            features_df: DataFrame with all feature values used for predictions
-            predictions_df: DataFrame with prediction results
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if features_df.empty or predictions_df.empty:
-            logger.warning("No feature data to export")
-            return False
-            
-        try:
-            # Merge feature values with prediction results
-            combined_df = features_df.merge(
-                predictions_df[['currency_pair', 'predicted_signal', 'signal_confidence', 'model_name']], 
-                on='currency_pair', 
-                how='left'
-            )
-            
-            # Add prediction_date from today
-            from datetime import datetime, timedelta
-            tomorrow = datetime.now().date() + timedelta(days=1)
-            combined_df['prediction_date'] = tomorrow
-            
-            # Reorder columns to match table schema
-            feature_columns = [
-                'prediction_date', 'currency_pair',
-                'open_price', 'high_price', 'low_price', 'close_price', 'volume',
-                'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
-                'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_200',
-                'rsi', 'macd', 'macd_signal', 'macd_histogram', 'atr',
-                'bb_upper', 'bb_middle', 'bb_lower', 'bb_width', 'bb_percent',
-                'daily_return', 'gap', 'volume_ratio',
-                'predicted_signal', 'signal_confidence', 'model_name'
-            ]
-            
-            # Select only columns that exist in the dataframe
-            available_columns = [col for col in feature_columns if col in combined_df.columns]
-            export_df = combined_df[available_columns].copy()
-            
-            # Fill missing values
-            export_df = export_df.fillna(0)
-            
-            logger.info(f"Inserting {len(export_df)} feature records with columns: {list(export_df.columns)}")
-            
-            engine = self.db.get_sqlalchemy_engine()
-            rows_inserted = export_df.to_sql(
-                'forex_prediction_features',
-                engine,
-                if_exists='append',
-                index=False,
-                method='multi'
-            )
-            
-            logger.info(f"✅ Exported {len(export_df)} feature records to forex_prediction_features")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Error exporting prediction features: {e}")
-            return False
-    
     def export_model_performance(self, model_results: Dict = None, model_name: str = 'forex_ml_model',
                                training_pairs: List[str] = None, training_date: datetime = None) -> bool:
         """
@@ -557,6 +492,20 @@ class ForexResultsExporter:
                 tomorrow = tomorrow + timedelta(days=1)
             combined_df['prediction_date'] = tomorrow
             
+            # Normalise column name variants produced by different model/feature versions:
+            #   rsi_14  -> rsi   (used by ml_models.py forex_feature_columns)
+            #   atr_14  -> atr
+            #   macd_histogram derived from macd - macd_signal when absent
+            rename_map = {}
+            if 'rsi_14' in combined_df.columns and 'rsi' not in combined_df.columns:
+                rename_map['rsi_14'] = 'rsi'
+            if 'atr_14' in combined_df.columns and 'atr' not in combined_df.columns:
+                rename_map['atr_14'] = 'atr'
+            if rename_map:
+                combined_df = combined_df.rename(columns=rename_map)
+            if 'macd_histogram' not in combined_df.columns and 'macd' in combined_df.columns and 'macd_signal' in combined_df.columns:
+                combined_df['macd_histogram'] = combined_df['macd'] - combined_df['macd_signal']
+
             # Define all feature columns in correct order
             feature_columns = [
                 'prediction_date', 'currency_pair',
@@ -576,7 +525,7 @@ class ForexResultsExporter:
             # Fill missing values with 0
             export_df = export_df.fillna(0)
             
-            logger.info(f"Inserting {len(export_df)} feature records with {len(available_columns)} columns")
+            logger.info(f"Inserting {len(export_df)} feature records with {len(available_columns)} columns: {available_columns}")
             
             engine = self.db.get_sqlalchemy_engine()
             rows_inserted = export_df.to_sql(
