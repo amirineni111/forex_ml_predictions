@@ -160,14 +160,21 @@ class ForexSQLServerConnection:
             logger.error(f"Error fetching forex pairs: {e}")
             return []
     
-    def get_forex_data_with_indicators(self, currency_pair: str, limit: Optional[int] = None) -> pd.DataFrame:
+    def get_forex_data_with_indicators(
+        self,
+        currency_pair: str,
+        limit: Optional[int] = None,
+        days_back: Optional[int] = None,
+    ) -> pd.DataFrame:
         """
         Fetch forex data with technical indicators for a specific currency pair using existing SQL Server views.
-        
+
         Args:
             currency_pair (str): Currency pair (e.g., 'EURUSD', 'GBPUSD')
             limit (int, optional): Number of records to fetch (latest first)
-            
+            days_back (int, optional): Only return records within this many calendar days.
+                Use this for rolling-window retrains (e.g. 90 days) to avoid stale regimes.
+
         Returns:
             pd.DataFrame: DataFrame with forex data and indicators
         """
@@ -246,21 +253,23 @@ class ForexSQLServerConnection:
             LEFT JOIN forex_bb_signals bb_signals ON h.symbol = bb_signals.symbol AND h.trading_date = bb_signals.trading_date
             LEFT JOIN forex_atr atr ON h.symbol = atr.symbol AND h.trading_date = atr.trading_date
             LEFT JOIN forex_atr_spikes atr_spikes ON h.symbol = atr_spikes.symbol AND h.trading_date = atr_spikes.trading_date
-            
+
             WHERE h.symbol = '{currency_pair}'
+            {f"AND h.trading_date >= DATEADD(day, -{days_back}, GETDATE())" if days_back else ""}
             ORDER BY h.trading_date DESC
             """
-            
+
             # Execute query
             df = pd.read_sql_query(query, self.get_sqlalchemy_engine())
-            
+
             # Convert date_time to datetime if needed
             if 'date_time' in df.columns:
                 df['date_time'] = pd.to_datetime(df['date_time'])
-            
-            logger.info(f"Fetched {len(df)} forex records with indicators for {currency_pair}")
+
+            logger.info(f"Fetched {len(df)} forex records with indicators for {currency_pair}"
+                        + (f" (last {days_back} days)" if days_back else ""))
             return df
-            
+
         except Exception as e:
             logger.error(f"Error fetching forex data for {currency_pair}: {str(e)}")
             raise

@@ -33,6 +33,67 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+# ---------------------------------------------------------------------------
+# FIX 1: Asymmetric signal thresholds
+# SELL was over-predicted (only 32-44% accurate at high confidence).
+# Raise its bar so the model only fires SELL when it is very sure.
+# ---------------------------------------------------------------------------
+SIGNAL_THRESHOLDS = {
+    'BUY':  0.55,   # BUY accuracy is solid — minor raise
+    'SELL': 0.75,   # SELL is chronically over-predicted — raise significantly
+    'HOLD': 0.50,   # neutral baseline
+}
+
+
+def apply_signal_thresholds(prob_map: dict) -> str:
+    """
+    Convert raw class probabilities to a signal using asymmetric thresholds.
+
+    Falls back to 'HOLD' when no class clears its threshold (no conviction).
+    """
+    candidates = {
+        sig: prob for sig, prob in prob_map.items()
+        if prob >= SIGNAL_THRESHOLDS.get(sig, 0.50)
+    }
+    if not candidates:
+        return 'HOLD'
+    return max(candidates, key=candidates.get)
+
+
+# ---------------------------------------------------------------------------
+# FIX 3: Technical veto layer
+# Pattern B: RSI<55, MACD<0, price<SMA20, BB%<40 → SELL accuracy only 37%.
+# When all 4 conditions hold, demote SELL → HOLD.
+# ---------------------------------------------------------------------------
+def technical_veto(signal: str, row: 'pd.Series') -> str:
+    """
+    Suppress SELL signals when technical indicators contradict the bearish call.
+    Only SELL signals are evaluated — BUY and HOLD pass through unchanged.
+    """
+    if signal != 'SELL':
+        return signal
+
+    rsi    = float(row.get('rsi_14', 50) or 50)
+    macd   = float(row.get('macd',    0) or 0)
+    close  = float(row.get('close_price', 0) or 0)
+    sma20  = float(row.get('sma_20',  close) or close)
+    bb_pct = float(row.get('bb_percent', 50) or 50)   # 0–1 scale from prepare_features
+
+    # bb_percent is stored as 0–1 ratio; convert to 0–100 if needed
+    if bb_pct <= 1.0:
+        bb_pct *= 100.0
+
+    pattern_b = (
+        rsi   < 55    and
+        macd  < 0     and
+        close < sma20 and
+        bb_pct < 40.0
+    )
+
+    if pattern_b:
+        return 'HOLD'   # veto: model is in Pattern B — historically only 37% accurate
+    return signal
 logger = logging.getLogger(__name__)
 
 def safe_print(text):
@@ -487,35 +548,53 @@ class ForexTradingSignalPredictor:
             
             # Make prediction for next trading day
             predictions = self.model_manager.predict(X_pred)
-            
+
             # Get probabilities if available
             try:
                 probabilities = self.model_manager.predict_proba(X_pred)
                 df_recent = df_recent.copy()
-                df_recent['signal'] = predictions
-                
-                # Add probability columns
-                if len(probabilities.shape) > 1:
+
+                # Add probability columns first so thresholds can use them
+                if len(probabilities.shape) > 1 and hasattr(self.model_manager.label_encoder, 'classes_'):
                     classes = self.model_manager.label_encoder.classes_
                     for i, class_name in enumerate(classes):
                         df_recent[f'prob_{class_name}'] = probabilities[:, i]
-                
+
+                    # --- FIX 1: Apply asymmetric thresholds row-by-row ---
+                    def _threshold_signal(row):
+                        prob_map = {c: row.get(f'prob_{c}', 0.0) for c in classes}
+                        return apply_signal_thresholds(prob_map)
+
+                    df_recent['signal'] = df_recent.apply(_threshold_signal, axis=1)
+                    safe_print("[INFO] Applied asymmetric SELL threshold (0.75 / BUY 0.55)")
+                else:
+                    df_recent['signal'] = predictions
+
             except Exception as e:
                 safe_print(f"[WARN] Could not get probabilities: {e}")
                 df_recent = df_recent.copy()
                 df_recent['signal'] = predictions
-            
+
             # Map direction to signal if using binary direction model
             signal_mapping = {'UP': 'BUY', 'DOWN': 'SELL'}
             if df_recent['signal'].iloc[0] in signal_mapping:
                 df_recent['predicted_direction'] = df_recent['signal']
                 df_recent['signal'] = df_recent['signal'].map(signal_mapping)
-            
+
+            # --- FIX 3: Technical veto — suppress SELL when Pattern B holds ---
+            original_signals = df_recent['signal'].copy()
+            df_recent['signal'] = df_recent.apply(
+                lambda row: technical_veto(row['signal'], row), axis=1
+            )
+            vetoed = (original_signals == 'SELL') & (df_recent['signal'] == 'HOLD')
+            if vetoed.any():
+                safe_print(f"[INFO] Technical veto demoted {vetoed.sum()} SELL(s) → HOLD (Pattern B)")
+
             # Add confidence score
             prob_cols = [c for c in df_recent.columns if c.startswith('prob_')]
             if prob_cols:
                 df_recent['confidence'] = df_recent[prob_cols].max(axis=1)
-            
+
             safe_print(f"[PREDICTION] Generated {len(predictions)} trading signals")
             
             # Display signal

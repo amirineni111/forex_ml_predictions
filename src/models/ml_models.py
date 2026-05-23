@@ -46,6 +46,7 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.utils.class_weight import compute_class_weight
 
 # Advanced ML libraries
 try:
@@ -702,11 +703,24 @@ class ForexMLModelManager:
         else:
             y_encoded = y_train.values
         
-        # Compute sample weights (prioritize recent data)
+        # FIX 2: Compute class-balance weights to counter SELL dominance (87% skew)
+        _classes_arr = np.unique(y_encoded)
+        _cw_vals = compute_class_weight('balanced', classes=_classes_arr, y=y_encoded)
+        _class_weight_map = dict(zip(_classes_arr, _cw_vals))
+        class_balance_weights = np.array([_class_weight_map[lbl] for lbl in y_encoded], dtype=float)
+        # Normalise so sum == n_samples
+        class_balance_weights *= len(class_balance_weights) / class_balance_weights.sum()
+
+        # Combine with exponential recency weights when requested
         if use_sample_weights:
-            sample_weights = self.compute_sample_weights(len(y_encoded), decay_factor=0.997)
+            recency_weights = self.compute_sample_weights(len(y_encoded), decay_factor=0.997)
+            combined = recency_weights * class_balance_weights
+            sample_weights = combined * len(combined) / combined.sum()
+            logger.info("Sample weights: recency decay × class balance applied")
         else:
-            sample_weights = None
+            # Even without recency weighting, still apply class balance
+            sample_weights = class_balance_weights
+            logger.info("Sample weights: class balance only (no recency decay)")
         
         results = {}
         

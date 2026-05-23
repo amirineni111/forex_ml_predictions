@@ -60,7 +60,7 @@ class EnhancedForexTrainer:
         self.enhanced_features_df = None
         self.feature_quality = None
         
-    def prepare_enhanced_dataset(self, currency_pairs: list = None, lookback_days: int = 1000) -> pd.DataFrame:
+    def prepare_enhanced_dataset(self, currency_pairs: list = None, lookback_days: int = 90) -> pd.DataFrame:
         """
         Prepare enhanced dataset with all available features.
         
@@ -79,8 +79,8 @@ class EnhancedForexTrainer:
             safe_print(f"[DATA] Processing {pair}...")
             
             try:
-                # Get base forex data with indicators
-                base_data = self.db.get_forex_data_with_indicators(pair)
+                # Get base forex data with indicators (rolling window for regime freshness)
+                base_data = self.db.get_forex_data_with_indicators(pair, days_back=lookback_days)
                 
                 if base_data.empty:
                     safe_print(f"[WARN] No data found for {pair}")
@@ -686,7 +686,7 @@ def main():
         currency_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
         safe_print(f"[INFO] Training on currency pairs: {', '.join(currency_pairs)}")
         
-        enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=800)
+        enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=90)
         
         # Train enhanced models with 3-CLASS prediction (BUY/SELL/HOLD)
         safe_print("\n" + "=" * 70)

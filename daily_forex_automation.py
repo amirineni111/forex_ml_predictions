@@ -487,8 +487,8 @@ class ForexDailyAutomation:
                 pairs = self.db.get_forex_pairs()
                 safe_print(f"[DATA] Found {len(pairs)} currency pairs for retraining")
                 
-                # Prepare enhanced dataset
-                enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=800)
+                # Prepare enhanced dataset — 90-day rolling window avoids stale regime bias
+                enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=90)
                 
                 # Train with 3-class prediction (BUY/SELL/HOLD) using trend signal type
                 results = trainer.train_enhanced_models(
