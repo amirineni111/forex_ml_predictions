@@ -16,11 +16,14 @@ This is the **Forex ML training pipeline** — part of a 7-repo stock trading an
 3. `predict_daily.py` — Daily predictions → forex_ml_predictions table
 
 ## Schedule
-- Daily 7:50 PM ET: Forex prediction run
+- Daily 6:00 PM ET: FRED rate ingestion → forex_rates_daily
+- Daily 8:55 PM ET: Forex prediction run
 - Sunday 10:00 AM: Weekly full retrain
 
-## Currency Pairs (10)
-USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY, GBP/JPY
+## Currency Pairs (actual, from forex_hist_data)
+EUR/USD, GBP/USD, USD/JPY, AUD/USD, NZD/USD, EUR/JPY, EUR/CHF, USD/HKD, USD/SGD, USD/INR
+(No USD/CHF, USD/CAD, EUR/GBP, or GBP/JPY in the DB. Trained as per-cluster models —
+see CLAUDE.md.)
 
 ## Sibling Repositories (same database)
 - `sqlserver_copilot` — NASDAQ ML pipeline (Gradient Boosting)

@@ -29,9 +29,13 @@ Trains a **multi-model ensemble** (XGBoost, LightGBM, VotingClassifier, Stacking
 
 ### Daily Schedule (Windows Task Scheduler)
 ```
-7:50 PM ET   Daily prediction run     → forex_ml_predictions
-Sunday 10 AM Weekly full retrain     → Updated model files
+6:00 PM ET   FRED rate ingestion      → forex_rates_daily   (scripts/seed_forex_rates.py)
+8:55 PM ET   Daily prediction run     → forex_ml_predictions
+Sunday 10 AM Weekly full retrain      → Updated per-cluster model files
 ```
+Register tasks via `scripts/setup_automation.ps1` (run as Administrator). Rate
+ingestion runs first so rate/yield-differential features are fresh before
+prediction and retraining.
 
 ### Key Files
 
@@ -50,24 +54,46 @@ sqlserver_copilot_forex/
 │   ├── forex_voting_model.pkl     # VotingClassifier
 │   ├── forex_stacking_model.pkl   # StackingClassifier (meta-learner)
 │   └── feature_columns.pkl        # Selected feature names
-├── config/
-│   └── settings.py                # .env configuration loader
 ├── logs/
 │   └── *.log                      # Execution logs
 └── notebooks/
     └── exploratory_analysis.ipynb # EDA notebooks
 ```
 
+> **Note:** the layout above is the original design sketch. The actual entry
+> points are `train_enhanced_model.py` (training), `predict_forex_signals.py`
+> (prediction), and `run_all_forex_predictions.py` (batch). Config is `.env` +
+> `src/forex_config.py` (no `config/` package). Key modules added for the
+> relative/per-cluster work:
+>
+> | File | Purpose |
+> |------|---------|
+> | `src/forex_config.py` | Cluster map, currency archetypes, external-table names, FRED series |
+> | `src/features/relative_features.py` | Currency-strength indices, rate/yield diffs, archetype routing, cross-pair momentum (operates on the combined multi-pair panel) |
+> | `src/data/external_sources.py` | `get_rates_data` / `get_intermarket_data` / `get_econ_events` (DB-read + yfinance fallback) |
+> | `scripts/seed_forex_rates.py` | FRED ingestion → `forex_rates_daily` |
+> | `data/forex_model_<cluster>.joblib` | One trained artifact per cluster |
+> | `data/best_forex_model.joblib` | Global fallback model |
+
 ---
 
 ## 3. ML MODEL DETAILS
 
 ### Model Architecture
-- **Models**: XGBoost, LightGBM, VotingClassifier, StackingClassifier
-- **Target**: Buy/Sell/Hold signal (3-class classification)
-- **Features**: 100+ engineered features from forex OHLCV + economic indicators
-- **Training Data**: `forex_hist_data` for 10 currency pairs
-- **Best Performer**: Stacking model (uses XGBoost + LightGBM as base learners)
+- **Per-cluster models**: pairs are grouped into clusters that share dominant
+  drivers, and **one model is trained per cluster** (not a single global model).
+  Each pair resolves to its cluster's artifact at predict time, with the global
+  `best_forex_model.joblib` as fallback. Clusters: `usd_majors`, `commodity`,
+  `jpy_crosses`, `eur_crosses`, `usd_asia` (see `src/forex_config.py`).
+- **Models per cluster**: XGBoost, LightGBM, VotingClassifier, StackingClassifier
+  (best selected by walk-forward accuracy + stability checks).
+- **Target**: Buy/Sell/Hold signal (3-class), adaptive volatility-based thresholds.
+- **Features**: ~150 engineered features — per-pair technicals **plus** cross-pair
+  relative features (currency strength, rate/yield differentials, archetype-routed
+  risk signals). The relative features are the key FX-specific addition: an FX pair
+  is the *relative* price of two economies, not an absolute asset.
+- **Training Data**: `forex_hist_data` for all active pairs (full basket needed so
+  currency-strength indices can be derived).
 
 ### Feature Categories (100+)
 | Category | Examples |
@@ -79,7 +105,9 @@ sqlserver_copilot_forex/
 | Volume | Volume ratios, on-balance volume proxies |
 | Forex-specific | Pip volatility, session overlaps, carry trade proxies |
 | Lag features | Lagged returns, lagged indicators (1-5 periods) |
-| **Market context** | VIX, DXY, S&P 500, US 10Y yield — now reads from shared `market_context_daily` DB table via `ExternalDataSources(use_db=True)`, with yfinance fallback |
+| **Market context** | VIX, DXY, S&P 500, US 10Y yield — reads from shared `market_context_daily` DB table via `ExternalDataSources(use_db=True)`, with yfinance fallback |
+| **Relative / cross-pair** ⭐ | Currency-strength indices (`base/quote_strength`, `strength_diff`), cross-pair momentum (`ret_vs_cluster`), archetype-routed risk signals (`dxy_x_usd`, `goldret_x_commodity`, `vix_x_safehaven`). Computed in `src/features/relative_features.py` over the full basket. |
+| **Rate / yield differentials** ⭐ | `policy_rate_diff`, `yield_2y_diff`, `yield_10y_diff`, `carry_sign` — base-minus-quote, from `forex_rates_daily` (FRED). The dominant medium-term FX driver. Dormant until `forex_rates_daily` is seeded; features skip gracefully if absent. |
 
 ### Output Table: `forex_ml_predictions`
 | Column | Type | Description |
@@ -94,8 +122,22 @@ sqlserver_copilot_forex/
 | model_name | VARCHAR | Which model produced prediction |
 | model_version | VARCHAR | Model version identifier |
 
-### Currency Pairs (10)
-USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY, GBP/JPY
+### Currency Pairs (actual, from `forex_hist_data`)
+> ⚠️ The pairs actually present in the DB differ from earlier docs. There is **no**
+> USD/CHF, USD/CAD, EUR/GBP, or GBP/JPY; instead EUR/CHF and the Asian pairs
+> USD/HKD, USD/SGD, USD/INR are present. `train_enhanced_model.py` fetches the live
+> list via `get_forex_pairs()`.
+
+| Cluster | Pairs |
+|---------|-------|
+| `usd_majors` | EUR/USD, GBP/USD |
+| `commodity` | AUD/USD, NZD/USD |
+| `jpy_crosses` | USD/JPY, EUR/JPY |
+| `eur_crosses` | EUR/CHF |
+| `usd_asia` (pegged/managed) | USD/HKD, USD/SGD, USD/INR |
+
+The map in `src/forex_config.py` also covers USD/CAD, GBP/JPY, EUR/GBP, USD/CHF so
+it stays correct if those pairs are added later.
 
 ---
 
@@ -110,12 +152,21 @@ USD/INR, EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY,
 | Table | Purpose |
 |-------|---------|
 | `forex_hist_data` | Historical OHLCV + daily changes + moving averages |
-| `forex_master` | Currency pair master list (10 active pairs) |
+| `forex_master` | Currency pair master list |
+| `market_context_daily` | VIX/DXY/S&P/NASDAQ/US10Y market context |
+| `forex_rates_daily` ⭐ | Per-currency policy rate + 2Y/10Y yields (FRED). Seeded by `scripts/seed_forex_rates.py`. |
+| `forex_intermarket_daily` | Gold/oil/copper, commodity & EM-FX indices, risk-on (optional; yfinance fallback) |
+| `forex_econ_events` | Central-bank/CPI/NFP/GDP event flags per currency (optional) |
+
+> `forex_rates_daily` / `forex_intermarket_daily` / `forex_econ_events` are read by
+> `ExternalDataSources` and **skip gracefully when absent**. Only `forex_rates_daily`
+> has an ingestion script in this repo so far.
 
 ### Tables This Repo WRITES
 | Table | Purpose |
 |-------|---------|
-| `forex_ml_predictions` | Daily Buy/Sell/Hold predictions per pair |
+| `forex_ml_predictions` | Daily Buy/Sell/Hold predictions per pair (`model_name` = `forex_cluster_<cluster>`) |
+| `forex_model_performance` | Per-model training metrics (cluster identity in `model_name`) |
 
 ---
 
