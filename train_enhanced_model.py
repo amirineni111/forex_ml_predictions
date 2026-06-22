@@ -23,9 +23,14 @@ from pathlib import Path
 sys.path.append('src')
 
 from database.connection import ForexSQLServerConnection
+from database.export_results import ForexResultsExporter
 from features.advanced_features import AdvancedForexFeatures
+from features.relative_features import RelativeForexFeatures
 from models.advanced_models import AdvancedForexModels
 from data.external_sources import ExternalDataSources
+from forex_config import (
+    cluster_for_pair, all_clusters, cluster_model_path, MIN_CLUSTER_SAMPLES,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,8 +60,10 @@ class EnhancedForexTrainer:
     def __init__(self):
         self.db = ForexSQLServerConnection()
         self.feature_engineer = AdvancedForexFeatures()
+        self.relative_engineer = RelativeForexFeatures()
         self.model_trainer = AdvancedForexModels()
         self.external_data = ExternalDataSources()
+        self.exporter = ForexResultsExporter(self.db)
         self.enhanced_features_df = None
         self.feature_quality = None
         
@@ -119,7 +126,15 @@ class EnhancedForexTrainer:
         # Combine all data
         combined_data = pd.concat(all_data, ignore_index=True)
         safe_print(f"[DATA] Combined dataset: {len(combined_data)} records, {len(combined_data.columns)} features")
-        
+
+        # Cross-sectional relative features (currency strength, rate/yield diffs,
+        # archetype routing, cross-pair momentum). These need the FULL basket, so
+        # they run on the combined panel before any per-cluster split.
+        combined_data = self._add_relative_features(combined_data)
+
+        # Tag each row with its cluster for per-cluster training (excluded from features)
+        combined_data['cluster'] = combined_data['currency_pair'].map(cluster_for_pair)
+
         # Feature engineering and encoding
         combined_data = self.feature_engineer.encode_categorical_features(combined_data)
         
@@ -129,6 +144,32 @@ class EnhancedForexTrainer:
         self.enhanced_features_df = combined_data
         return combined_data
     
+    def _add_relative_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add cross-pair / fundamental relative features on the combined panel.
+
+        Fetches the new external fundamental sources (rates/yields, intermarket,
+        macro events) once for the full date range, then delegates to
+        RelativeForexFeatures. Degrades gracefully when those tables are absent.
+        """
+        try:
+            if 'date_time' not in df.columns:
+                return df
+            start_date = pd.to_datetime(df['date_time']).min().strftime('%Y-%m-%d')
+            end_date = pd.to_datetime(df['date_time']).max().strftime('%Y-%m-%d')
+
+            rates_wide = self.external_data.get_rates_data(start_date, end_date)
+            intermarket = self.external_data.get_intermarket_data(start_date, end_date)
+            events = self.external_data.get_econ_events(start_date, end_date)
+
+            before = len(df.columns)
+            df = self.relative_engineer.add_relative_features(
+                df, rates_wide=rates_wide, intermarket=intermarket, events=events,
+            )
+            safe_print(f"[DATA] Relative features added: +{len(df.columns) - before} columns")
+        except Exception as e:
+            logger.warning(f"Could not add relative features: {e}")
+        return df
+
     def _add_external_features(self, df: pd.DataFrame, currency_pair: str) -> pd.DataFrame:
         """Add external market features."""
         try:
@@ -268,15 +309,24 @@ class EnhancedForexTrainer:
         
         safe_print("")
     
-    def train_enhanced_models(self, test_size: float = 0.2, 
-                             use_binary_direction: bool = False) -> dict:
+    def train_enhanced_models(self, test_size: float = 0.2,
+                             use_binary_direction: bool = False,
+                             df: pd.DataFrame = None,
+                             model_filename: str = 'enhanced_forex_model.joblib',
+                             update_main: bool = True) -> dict:
         """
         Train enhanced models with all improvements.
-        
+
         Args:
             test_size: Fraction of data for testing
             use_binary_direction: If False, use 3-class BUY/SELL/HOLD prediction (recommended to fix SELL bias)
-        
+            df: Optional data subset to train on (e.g. one cluster). Defaults to
+                the full self.enhanced_features_df.
+            model_filename: Artifact filename under data/ (per-cluster models pass
+                forex_model_<cluster>.joblib).
+            update_main: Also overwrite data/best_forex_model.joblib (single global
+                model only — leave False for per-cluster artifacts).
+
         Key improvements:
         - Binary direction prediction for better accuracy
         - Walk-forward validation
@@ -284,12 +334,14 @@ class EnhancedForexTrainer:
         - Sample weighting
         - Overfitting checks
         """
-        
-        if self.enhanced_features_df is None:
+
+        if df is None:
+            df = self.enhanced_features_df
+        if df is None:
             raise ValueError("Must call prepare_enhanced_dataset first")
-        
+
         safe_print("[INFO] Training enhanced models for direction accuracy...")
-        
+
         # Choose target variable
         if use_binary_direction:
             target_col = 'target_direction'
@@ -297,17 +349,21 @@ class EnhancedForexTrainer:
         else:
             target_col = 'target_signal'
             safe_print("[INFO] Using 3-class prediction (BUY/SELL/HOLD)")
-        
-        if target_col not in self.enhanced_features_df.columns:
-            safe_print(f"[ERROR] Target column {target_col} not found. Available: {list(self.enhanced_features_df.columns)}")
+
+        if target_col not in df.columns:
+            safe_print(f"[ERROR] Target column {target_col} not found. Available: {list(df.columns)}")
             return {}
-        
+
         # Prepare features and target
-        feature_columns = self._select_feature_columns()
-        
-        # Remove rows with missing target
-        valid_data = self.enhanced_features_df.dropna(subset=[target_col])
-        
+        feature_columns = self._select_feature_columns(df)
+
+        # Remove rows with missing target, then sort chronologically so the
+        # time-based holdout split is a true forward holdout (the combined panel
+        # is pair-blocked, not date-ordered).
+        valid_data = df.dropna(subset=[target_col])
+        if 'date_time' in valid_data.columns:
+            valid_data = valid_data.sort_values('date_time')
+
         X = valid_data[feature_columns].copy()
         y = valid_data[target_col].copy()
         
@@ -374,11 +430,13 @@ class EnhancedForexTrainer:
         
         # Save enhanced model
         self._save_enhanced_model(
-            best_model, best_model_name, 
-            X_selected.columns.tolist(), 
-            label_encoder, results, 
+            best_model, best_model_name,
+            X_selected.columns.tolist(),
+            label_encoder, results,
             self.model_trainer.scaler,
-            wf_results
+            wf_results,
+            model_filename=model_filename,
+            update_main=update_main,
         )
         
         return {
@@ -392,45 +450,114 @@ class EnhancedForexTrainer:
             'scaler': self.model_trainer.scaler,
             'stability_passed': stability_ok
         }
-    
-    def _select_feature_columns(self) -> list:
+
+    def train_per_cluster(self, test_size: float = 0.2,
+                          use_binary_direction: bool = False,
+                          min_samples: int = MIN_CLUSTER_SAMPLES) -> dict:
+        """
+        Train one model per currency-pair cluster (plan Phase 4).
+
+        Each cluster (usd_majors / commodity / jpy_crosses / eur_crosses) is
+        trained on its own subset of the combined panel and saved to
+        data/forex_model_<cluster>.joblib. Clusters with too few rows fall back to
+        being skipped (the global model still covers them via best_forex_model).
+
+        Returns a dict mapping cluster -> training result summary.
+        """
+        if self.enhanced_features_df is None:
+            raise ValueError("Must call prepare_enhanced_dataset first")
+        if 'cluster' not in self.enhanced_features_df.columns:
+            self.enhanced_features_df['cluster'] = (
+                self.enhanced_features_df['currency_pair'].map(cluster_for_pair))
+
+        summary = {}
+        for cluster in all_clusters():
+            grp = self.enhanced_features_df[self.enhanced_features_df['cluster'] == cluster]
+            safe_print("\n" + "=" * 70)
+            safe_print(f"  CLUSTER: {cluster}  ({len(grp)} rows, "
+                       f"pairs: {sorted(grp['currency_pair'].unique().tolist())})")
+            safe_print("=" * 70)
+
+            if len(grp) < min_samples:
+                safe_print(f"[WARN] Cluster '{cluster}' has {len(grp)} rows "
+                           f"(< {min_samples}) — skipping dedicated model")
+                summary[cluster] = {'skipped': True, 'rows': len(grp)}
+                continue
+
+            try:
+                res = self.train_enhanced_models(
+                    test_size=test_size,
+                    use_binary_direction=use_binary_direction,
+                    df=grp,
+                    model_filename=f'forex_model_{cluster}.joblib',
+                    update_main=False,
+                )
+                summary[cluster] = {
+                    'skipped': False,
+                    'rows': len(grp),
+                    'best_model_name': res.get('best_model_name'),
+                    'feature_count': len(res.get('feature_columns', [])),
+                    'stability_passed': res.get('stability_passed'),
+                }
+                # Phase 5: persist metrics tagged by cluster for global-vs-cluster
+                # comparison. The cluster identity rides in model_name (the shared
+                # currency_pair column is only VARCHAR(10), too small for a pair list).
+                try:
+                    self.exporter.export_model_performance(
+                        res.get('results'),
+                        model_name=f'forex_cluster_{cluster}',
+                        training_pairs=None,
+                    )
+                except Exception as e:
+                    safe_print(f"[WARN] Could not persist performance for '{cluster}': {e}")
+            except Exception as e:
+                safe_print(f"[ERROR] Cluster '{cluster}' training failed: {e}")
+                summary[cluster] = {'skipped': True, 'error': str(e), 'rows': len(grp)}
+
+        return summary
+
+    def _select_feature_columns(self, df: pd.DataFrame = None) -> list:
         """Select relevant feature columns for training."""
-        
+
+        if df is None:
+            df = self.enhanced_features_df
+
         # Exclude non-feature columns (including future-looking data AND target leakage!)
         exclude_columns = [
-            'currency_pair', 'date_time', 'target_signal', 'target_direction',
+            'currency_pair', 'date_time', 'cluster',
+            'target_signal', 'target_direction',
             'target_signal_encoded', 'target_direction_encoded',  # Prevent target leakage
             'future_return_1d', 'future_return_3d', 'future_return_5d',
             'signal', 'future_return'  # Any target-related columns
         ]
-        
+
         # Also exclude any column with 'signal' in the name (except encoded ones)
         # Also exclude any column starting with 'target_' to catch any encoded variants
         feature_columns = [
-            col for col in self.enhanced_features_df.columns 
-            if col not in exclude_columns 
+            col for col in df.columns
+            if col not in exclude_columns
             and not col.startswith('target_')  # Prevent ANY target_* leakage
             and not (col.endswith('_signal') and not col.endswith('_encoded'))
         ]
-        
+
         # Select only numeric columns
         numeric_features = []
         for col in feature_columns:
-            dtype = self.enhanced_features_df[col].dtype
+            dtype = df[col].dtype
             if dtype in ['int64', 'float64', 'bool', 'int32', 'float32']:
                 numeric_features.append(col)
             elif col.endswith('_encoded'):
                 numeric_features.append(col)
         
         # Remove features with very low variance (uninformative)
-        variances = self.enhanced_features_df[numeric_features].var()
+        variances = df[numeric_features].var()
         low_var_features = variances[variances < 1e-10].index.tolist()
         if low_var_features:
             safe_print(f"[INFO] Removing {len(low_var_features)} zero-variance features")
             numeric_features = [f for f in numeric_features if f not in low_var_features]
-        
+
         # Remove features with >50% missing values
-        missing_rates = self.enhanced_features_df[numeric_features].isnull().mean()
+        missing_rates = df[numeric_features].isnull().mean()
         high_missing = missing_rates[missing_rates > 0.5].index.tolist()
         if high_missing:
             safe_print(f"[INFO] Removing {len(high_missing)} features with >50% missing values")
@@ -619,27 +746,35 @@ class EnhancedForexTrainer:
     
     def _save_enhanced_model(self, model, model_name: str, feature_columns: list,
                            label_encoder, all_results: dict, scaler=None,
-                           wf_results: dict = None):
+                           wf_results: dict = None,
+                           model_filename: str = 'enhanced_forex_model.joblib',
+                           update_main: bool = True):
         """Save the enhanced model with all artifacts."""
-        
+
         import joblib
         from pathlib import Path
-        
+
         # Create data directory
         data_dir = Path('data')
         data_dir.mkdir(exist_ok=True)
         
+        # Derive cluster label from the artifact filename (forex_model_<cluster>.joblib)
+        cluster_label = None
+        if model_filename.startswith('forex_model_') and model_filename.endswith('.joblib'):
+            cluster_label = model_filename[len('forex_model_'):-len('.joblib')]
+
         # Prepare model artifacts
         model_artifacts = {
             'model': model,
             'model_name': model_name,
+            'cluster': cluster_label,
             'scaler': scaler,
             'feature_columns': feature_columns,
             'label_encoder': label_encoder,
             'training_results': all_results,
             'walk_forward_results': wf_results,
             'training_date': datetime.now().isoformat(),
-            'model_version': '3.0_enhanced_direction',
+            'model_version': '4.0_cluster_relative' if cluster_label else '3.0_enhanced_direction',
             'improvements': [
                 'binary_direction_prediction',
                 'adaptive_thresholds',
@@ -653,14 +788,15 @@ class EnhancedForexTrainer:
         }
         
         # Save model
-        model_path = data_dir / 'enhanced_forex_model.joblib'
+        model_path = data_dir / model_filename
         joblib.dump(model_artifacts, model_path)
         safe_print(f"[SAVE] Enhanced model saved to: {model_path}")
-        
-        # Also update the main model file
-        main_model_path = data_dir / 'best_forex_model.joblib'
-        joblib.dump(model_artifacts, main_model_path)
-        safe_print(f"[SAVE] Updated main model: {main_model_path}")
+
+        # Also update the main model file (global model only)
+        if update_main:
+            main_model_path = data_dir / 'best_forex_model.joblib'
+            joblib.dump(model_artifacts, main_model_path)
+            safe_print(f"[SAVE] Updated main model: {main_model_path}")
 
 
 def main():
@@ -682,21 +818,54 @@ def main():
         
         safe_print("[OK] Database connection established")
         
-        # Prepare enhanced dataset
-        currency_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
+        # Prepare enhanced dataset — full basket so currency-strength / relative
+        # features are computed across all pairs. Use the live pair list from the
+        # DB (falls back to the configured default) and a long window so each
+        # cluster has enough rows for a dedicated model.
+        from forex_config import DEFAULT_PAIRS
+        currency_pairs = trainer.db.get_forex_pairs() or DEFAULT_PAIRS
         safe_print(f"[INFO] Training on currency pairs: {', '.join(currency_pairs)}")
-        
-        enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=90)
-        
-        # Train enhanced models with 3-CLASS prediction (BUY/SELL/HOLD)
+
+        enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=400)
+
+        # 1) Global model (fallback for unmapped pairs + Phase-5 comparison baseline)
         safe_print("\n" + "=" * 70)
-        safe_print("  TRAINING WITH 3-CLASS SIGNALS (BUY/SELL/HOLD)")
+        safe_print("  TRAINING GLOBAL MODEL (3-class, baseline + fallback)")
         safe_print("=" * 70)
-        results = trainer.train_enhanced_models(test_size=0.2, use_binary_direction=False)
-        
+        results = trainer.train_enhanced_models(
+            test_size=0.2, use_binary_direction=False,
+            model_filename='enhanced_forex_model.joblib', update_main=True)
+
         if not results:
-            safe_print("[ERROR] Training produced no results")
+            safe_print("[ERROR] Global training produced no results")
             return
+
+        # Phase 5: persist global baseline metrics for global-vs-cluster comparison
+        # (currency_pair column is VARCHAR(10); identity rides in model_name).
+        try:
+            trainer.exporter.export_model_performance(
+                results.get('results'),
+                model_name='forex_global',
+                training_pairs=None,
+            )
+        except Exception as e:
+            safe_print(f"[WARN] Could not persist global performance: {e}")
+
+        # 2) Per-cluster models (production: each pair family learns its own drivers)
+        safe_print("\n" + "=" * 70)
+        safe_print("  TRAINING PER-CLUSTER MODELS")
+        safe_print("=" * 70)
+        cluster_summary = trainer.train_per_cluster(test_size=0.2, use_binary_direction=False)
+
+        safe_print("\n  Per-cluster training summary:")
+        for cluster, info in cluster_summary.items():
+            if info.get('skipped'):
+                safe_print(f"   {cluster:14s}: SKIPPED ({info.get('rows')} rows)"
+                           + (f" err={info['error']}" if info.get('error') else ""))
+            else:
+                safe_print(f"   {cluster:14s}: {info.get('best_model_name')} "
+                           f"({info.get('feature_count')} feats, "
+                           f"stability={'OK' if info.get('stability_passed') else 'CHECK'})")
         
         safe_print("\n" + "=" * 70)
         safe_print("  TRAINING COMPLETED!")

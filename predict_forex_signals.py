@@ -25,6 +25,7 @@ sys.path.append(os.path.join(os.getcwd(), 'src'))
 from database.connection import ForexSQLServerConnection
 from database.export_results import ForexResultsExporter
 from models.ml_models import ForexMLModelManager
+from forex_config import cluster_for_pair, cluster_model_path
 
 warnings.filterwarnings('ignore')
 
@@ -128,16 +129,18 @@ class ForexTradingSignalPredictor:
     
     def __init__(self, model_path=None, currency_pair=None):
         """Initialize the Forex predictor with saved model artifacts."""
-        
-        # Default paths
-        self.model_path = model_path or './data/best_forex_model.joblib'
+
+        # Resolve the model path. Prefer the per-cluster model for this pair when
+        # one exists; fall back to the global best_forex_model otherwise.
         self.currency_pair = currency_pair
+        self.model_path = self._resolve_model_path(model_path, currency_pair)
         
         # Model components
         self.model_manager = None
         self.model_version = None
         self.model_scaler = None
         self.model_feature_columns = None
+        self.model_cluster = None
         
         # Load model artifacts
         self.load_model_artifacts()
@@ -187,6 +190,20 @@ class ForexTradingSignalPredictor:
             'sma_trade_signal_encoded', 'bb_signal_strength_encoded', 'atr_signal_strength_encoded'
         ]
     
+    def _resolve_model_path(self, model_path, currency_pair):
+        """Pick the per-cluster model for this pair, else the global fallback."""
+        if model_path:
+            return model_path
+        global_path = './data/best_forex_model.joblib'
+        if currency_pair:
+            cluster = cluster_for_pair(currency_pair)
+            cpath = './' + cluster_model_path(cluster, model_dir='data').replace('\\', '/')
+            if os.path.exists(cpath):
+                safe_print(f"[INFO] Using per-cluster model '{cluster}' for {currency_pair}")
+                return cpath
+            safe_print(f"[INFO] No cluster model for '{cluster}' — using global model")
+        return global_path
+
     def load_model_artifacts(self):
         """Load the trained model artifacts with version detection."""
         if os.path.exists(self.model_path):
@@ -223,6 +240,9 @@ class ForexTradingSignalPredictor:
         self.model_manager.scaler = artifacts.get('scaler')
         self.model_manager.label_encoder = artifacts.get('label_encoder')
         
+        # Cluster this model was trained for (per-cluster v4 artifacts)
+        self.model_cluster = artifacts.get('cluster')
+
         # Use the model's specific feature columns if available
         self.model_feature_columns = artifacts.get('feature_columns')
         if self.model_feature_columns:
@@ -315,10 +335,117 @@ class ForexTradingSignalPredictor:
         
         return df
     
+    # Class-level cache: the relative-feature panel (basket + externals + computed
+    # relative features) is identical regardless of target pair, so the per-pair
+    # predictor instances created in one daily run share a single computation
+    # instead of re-fetching the whole basket + yfinance + DB tables 10x.
+    _REL_PANEL_CACHE = {'rel': None, 'basket_cols': None, 'ts': 0.0}
+    _REL_PANEL_TTL = 1800  # seconds — a daily batch completes well within this
+
+    def _compute_relative_panel(self):
+        """Build (and cache) the full multi-pair relative-feature panel for this run.
+
+        Returns (rel_df, basket_cols) or (None, None) on failure. Cached on the
+        class with a short TTL so repeated per-pair calls in one process reuse it.
+        """
+        import time
+        cache = ForexTradingSignalPredictor._REL_PANEL_CACHE
+        if cache['rel'] is not None and (time.time() - cache['ts']) < self._REL_PANEL_TTL:
+            return cache['rel'], cache['basket_cols']
+
+        from features.relative_features import RelativeForexFeatures
+        from data.external_sources import ExternalDataSources
+
+        pairs = self.db.get_forex_pairs()
+        if not pairs:
+            return None, None
+
+        # Lightweight basket: currency_pair, date_time, close_price for every pair
+        frames = []
+        for p in pairs:
+            try:
+                bd = self.db.get_forex_data_with_indicators(p, days_back=150)
+                if bd is None or bd.empty:
+                    continue
+                cols = [c for c in ['currency_pair', 'date_time', 'close_price'] if c in bd.columns]
+                if {'currency_pair', 'date_time', 'close_price'}.issubset(cols):
+                    frames.append(bd[cols].copy())
+            except Exception:
+                continue
+        if not frames:
+            return None, None
+        basket = pd.concat(frames, ignore_index=True)
+        basket['date_time'] = pd.to_datetime(basket['date_time'])
+
+        # External fundamental sources for the basket date range (fetched once)
+        start = basket['date_time'].min().strftime('%Y-%m-%d')
+        end = basket['date_time'].max().strftime('%Y-%m-%d')
+        ext = ExternalDataSources()
+        rates = ext.get_rates_data(start, end)
+        intermarket = ext.get_intermarket_data(start, end)
+        events = ext.get_econ_events(start, end)
+        try:
+            sentiment = ext.get_market_sentiment_data(start, end)
+            if sentiment is not None and not sentiment.empty:
+                basket = basket.merge(sentiment, left_on='date_time',
+                                      right_index=True, how='left')
+        except Exception:
+            pass
+
+        basket_cols = list(basket.columns)
+        rel = RelativeForexFeatures().add_relative_features(
+            basket, rates_wide=rates, intermarket=intermarket, events=events)
+
+        cache['rel'] = rel
+        cache['basket_cols'] = basket_cols
+        cache['ts'] = time.time()
+        safe_print(f"[DATA] Relative panel computed for {len(pairs)} pairs (cached for reuse)")
+        return rel, basket_cols
+
+    def _add_relative_features(self, df_features: pd.DataFrame) -> pd.DataFrame:
+        """Merge the target pair's cross-pair relative features onto df_features.
+
+        Uses the shared (cached) panel from _compute_relative_panel, then slices
+        the target pair's rows and joins by date. Fully defensive: any failure
+        leaves df_features unchanged (missing columns are later filled by the
+        feature alignment step).
+        """
+        try:
+            target = self.currency_pair
+            if not target and 'currency_pair' in df_features.columns and len(df_features):
+                target = str(df_features['currency_pair'].iloc[0])
+            if not target:
+                return df_features
+
+            rel, basket_cols = self._compute_relative_panel()
+            if rel is None or rel.empty:
+                return df_features
+
+            target_key = target.replace('/', '').replace('_', '').upper()
+            rel = rel.copy()
+            rel['_k'] = rel['currency_pair'].astype(str).str.replace('/', '', regex=False).str.upper()
+            sub = rel[rel['_k'] == target_key].drop(columns=['_k'], errors='ignore')
+            if sub.empty:
+                return df_features
+
+            new_cols = [c for c in sub.columns
+                        if c not in basket_cols and c != 'currency_pair'
+                        and c not in df_features.columns]
+            if not new_cols:
+                return df_features
+
+            df_features['date_time'] = pd.to_datetime(df_features['date_time'])
+            df_features = df_features.merge(
+                sub[['date_time'] + new_cols], on='date_time', how='left')
+            safe_print(f"[DATA] Relative features merged: +{len(new_cols)} columns")
+        except Exception as e:
+            safe_print(f"[WARN] Could not add relative features: {e}")
+        return df_features
+
     def prepare_features(self, df):
         """
         Prepare features for prediction with proper alignment.
-        
+
         Enhanced to align with model's expected features.
         """
         
@@ -345,7 +472,11 @@ class ForexTradingSignalPredictor:
             
             # Merge calendar features (holidays, short weeks, bank holidays)
             df_features = self._merge_calendar_features(df_features)
-            
+
+            # Add cross-pair relative features (currency strength, rate/yield diffs,
+            # archetype routing) computed from the whole basket — same as training.
+            df_features = self._add_relative_features(df_features)
+
             # Determine which features to use
             if self.model_feature_columns:
                 # Use model's specific features (v3 enhanced)
@@ -737,7 +868,9 @@ def main():
     
     # Export to database if requested
     if args.export_db:
-        predictor.export_to_database(predictions, model_name='forex_ml_model')
+        model_name = (f'forex_cluster_{predictor.model_cluster}'
+                      if predictor.model_cluster else 'forex_ml_model')
+        predictor.export_to_database(predictions, model_name=model_name)
     
     safe_print("\n[OK] Forex signal prediction completed!")
 
