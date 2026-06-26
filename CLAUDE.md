@@ -25,17 +25,32 @@ This is the **Forex ML training pipeline** — one of **7 interconnected reposit
 ## 2. THIS REPO: sqlserver_copilot_forex
 
 ### Purpose
-Trains a **multi-model ensemble** (XGBoost, LightGBM, VotingClassifier, StackingClassifier) on 10 forex currency pairs to predict Buy/Sell/Hold signals, then writes predictions to `forex_ml_predictions`.
+Trains a **single global model** (best of XGBoost / LightGBM / VotingClassifier /
+StackingClassifier, selected by walk-forward accuracy + stability) on 10 forex
+currency pairs to predict **binary direction (UP→Buy / DOWN→Sell)**, then writes
+predictions to `forex_ml_predictions`.
+
+> **⚠️ History (2026-06-25):** an earlier per-cluster + cross-pair "relative
+> features" design (commit `d1b0986`) was **rolled back** — it introduced
+> train/serve skew that dropped backtest accuracy to ~25%. In the process a
+> long-standing **look-ahead leakage** bug was also found and fixed (see §5): the
+> DB returns rows newest-first and rolling/shift features were computed without
+> sorting ascending, which inflated reported accuracy to ~80–89%. With leakage
+> removed, the 3-class BUY/HOLD/SELL target showed **no edge** (~41.5% WF vs 41%
+> baseline), so production switched to the **binary** target, which has a real
+> out-of-sample edge (~59–62% WF vs 50% coin-flip). The previous tag
+> `forex-relative-features-d1b0986` preserves the rolled-back work.
 
 ### Daily Schedule (Windows Task Scheduler)
 ```
 6:00 PM ET   FRED rate ingestion      → forex_rates_daily   (scripts/seed_forex_rates.py)
 8:55 PM ET   Daily prediction run     → forex_ml_predictions
-Sunday 10 AM Weekly full retrain      → Updated per-cluster model files
+Sunday 10 AM Weekly full retrain      → Updated global model file
 ```
-Register tasks via `scripts/setup_automation.ps1` (run as Administrator). Rate
-ingestion runs first so rate/yield-differential features are fresh before
-prediction and retraining.
+Register tasks via `scripts/setup_automation.ps1` (run as Administrator). The FRED
+rate-ingestion infra is **retained** (additive); its rate/yield-differential
+features are not currently consumed by the model but the table stays seeded for
+future work.
 
 ### Key Files
 
@@ -61,39 +76,44 @@ sqlserver_copilot_forex/
 ```
 
 > **Note:** the layout above is the original design sketch. The actual entry
-> points are `train_enhanced_model.py` (training), `predict_forex_signals.py`
-> (prediction), and `run_all_forex_predictions.py` (batch). Config is `.env` +
-> `src/forex_config.py` (no `config/` package). Key modules added for the
-> relative/per-cluster work:
+> points are `train_enhanced_model.py` (training), `predict_forex_signals.py` and
+> `daily_forex_automation.py --run-now` (prediction; the scheduled task uses the
+> latter), and `run_all_forex_predictions.py` (dev batch). Config is `.env` +
+> `src/forex_config.py` (no `config/` package). Key modules:
 >
 > | File | Purpose |
 > |------|---------|
-> | `src/forex_config.py` | Cluster map, currency archetypes, external-table names, FRED series |
-> | `src/features/relative_features.py` | Currency-strength indices, rate/yield diffs, archetype routing, cross-pair momentum (operates on the combined multi-pair panel) |
-> | `src/data/external_sources.py` | `get_rates_data` / `get_intermarket_data` / `get_econ_events` (DB-read + yfinance fallback) |
-> | `scripts/seed_forex_rates.py` | FRED ingestion → `forex_rates_daily` |
-> | `data/forex_model_<cluster>.joblib` | One trained artifact per cluster |
-> | `data/best_forex_model.joblib` | Global fallback model |
+> | `train_enhanced_model.py` | Trains the global binary model on a 400-day window |
+> | `src/features/advanced_features.py` | ~150 per-pair technical features. **Sorts ascending by `date_time` first** (critical — see §5). |
+> | `src/forex_config.py` | FRED series + table names (also retains an unused cluster/archetype map for possible future use) |
+> | `src/data/external_sources.py` | Market-context + (optional) rates/intermarket/event reads |
+> | `scripts/seed_forex_rates.py` | FRED ingestion → `forex_rates_daily` (retained, additive) |
+> | `data/best_forex_model.joblib` | The single production model artifact (git-ignored — retrain to regenerate) |
+>
+> Removed in the 2026-06-25 rollback: `src/features/relative_features.py` and the
+> per-cluster `data/forex_model_<cluster>.joblib` artifacts.
 
 ---
 
 ## 3. ML MODEL DETAILS
 
 ### Model Architecture
-- **Per-cluster models**: pairs are grouped into clusters that share dominant
-  drivers, and **one model is trained per cluster** (not a single global model).
-  Each pair resolves to its cluster's artifact at predict time, with the global
-  `best_forex_model.joblib` as fallback. Clusters: `usd_majors`, `commodity`,
-  `jpy_crosses`, `eur_crosses`, `usd_asia` (see `src/forex_config.py`).
-- **Models per cluster**: XGBoost, LightGBM, VotingClassifier, StackingClassifier
-  (best selected by walk-forward accuracy + stability checks).
-- **Target**: Buy/Sell/Hold signal (3-class), adaptive volatility-based thresholds.
-- **Features**: ~150 engineered features — per-pair technicals **plus** cross-pair
-  relative features (currency strength, rate/yield differentials, archetype-routed
-  risk signals). The relative features are the key FX-specific addition: an FX pair
-  is the *relative* price of two economies, not an absolute asset.
-- **Training Data**: `forex_hist_data` for all active pairs (full basket needed so
-  currency-strength indices can be derived).
+- **Single global model**: one model trained across all pairs (the per-cluster
+  design was rolled back). Candidates XGBoost / LightGBM / VotingClassifier /
+  StackingClassifier; the best is selected by walk-forward accuracy + stability
+  checks and saved to `data/best_forex_model.joblib`.
+- **Target**: **binary direction** — `target_direction` UP/DOWN from the sign of
+  the 1-day forward return, mapped to **Buy/Sell** at predict time (UP→Buy,
+  DOWN→Sell). **No Hold class.** The 3-class BUY/HOLD/SELL target (`target_signal`,
+  adaptive volatility thresholds) still exists in the code but is **not used in
+  production** — it had no measurable edge once leakage was removed.
+- **Features**: ~150 engineered per-pair technicals (`create_advanced_features`),
+  with ~30 selected for the model after variance/missingness filtering. Cross-pair
+  "relative" features were removed in the rollback.
+- **Measured performance (honest, leakage-free):** walk-forward / CV / test all
+  ~0.59–0.61 (vs 0.50 coin-flip). Known caveat: train/test overfitting gap ~0.20;
+  generalization is fine (the three estimates agree) but worth tuning down.
+- **Training Data**: `forex_hist_data` for all active pairs, 400-day window.
 
 ### Feature Categories (100+)
 | Category | Examples |
@@ -106,21 +126,21 @@ sqlserver_copilot_forex/
 | Forex-specific | Pip volatility, session overlaps, carry trade proxies |
 | Lag features | Lagged returns, lagged indicators (1-5 periods) |
 | **Market context** | VIX, DXY, S&P 500, US 10Y yield — reads from shared `market_context_daily` DB table via `ExternalDataSources(use_db=True)`, with yfinance fallback |
-| **Relative / cross-pair** ⭐ | Currency-strength indices (`base/quote_strength`, `strength_diff`), cross-pair momentum (`ret_vs_cluster`), archetype-routed risk signals (`dxy_x_usd`, `goldret_x_commodity`, `vix_x_safehaven`). Computed in `src/features/relative_features.py` over the full basket. |
-| **Rate / yield differentials** ⭐ | `policy_rate_diff`, `yield_2y_diff`, `yield_10y_diff`, `carry_sign` — base-minus-quote, from `forex_rates_daily` (FRED). The dominant medium-term FX driver. Dormant until `forex_rates_daily` is seeded; features skip gracefully if absent. |
+| ~~Relative / cross-pair~~ | **Removed in the 2026-06-25 rollback** (caused train/serve skew). Code lives only under tag `forex-relative-features-d1b0986`. |
+| ~~Rate / yield differentials~~ | **Not consumed by the current model.** `forex_rates_daily` is still seeded (FRED) for future use; the model does not read it. |
 
 ### Output Table: `forex_ml_predictions`
 | Column | Type | Description |
 |--------|------|-------------|
 | currency_pair | VARCHAR | e.g., 'USD/INR', 'EUR/USD' |
 | trading_date | DATE | Prediction date |
-| predicted_signal | VARCHAR | 'Buy', 'Sell', or 'Hold' |
+| predicted_signal | VARCHAR | **'Buy' or 'Sell'** (binary; Hold no longer produced) |
 | signal_confidence | FLOAT | Model confidence (0-100) |
-| prob_buy | FLOAT | P(Buy) from model |
-| prob_sell | FLOAT | P(Sell) from model |
-| prob_hold | FLOAT | P(Hold) from model |
-| model_name | VARCHAR | Which model produced prediction |
-| model_version | VARCHAR | Model version identifier |
+| prob_buy | FLOAT | P(Buy) = P(UP) from model |
+| prob_sell | FLOAT | P(Sell) = P(DOWN) from model |
+| prob_hold | FLOAT | Always 0.0 under the binary model |
+| model_name | VARCHAR | `daily_automation_model` (daily run) |
+| model_version | VARCHAR | `5.0_binary_noleak` (current) |
 
 ### Currency Pairs (actual, from `forex_hist_data`)
 > ⚠️ The pairs actually present in the DB differ from earlier docs. There is **no**
@@ -128,16 +148,20 @@ sqlserver_copilot_forex/
 > USD/HKD, USD/SGD, USD/INR are present. `train_enhanced_model.py` fetches the live
 > list via `get_forex_pairs()`.
 
-| Cluster | Pairs |
-|---------|-------|
-| `usd_majors` | EUR/USD, GBP/USD |
-| `commodity` | AUD/USD, NZD/USD |
-| `jpy_crosses` | USD/JPY, EUR/JPY |
-| `eur_crosses` | EUR/CHF |
-| `usd_asia` (pegged/managed) | USD/HKD, USD/SGD, USD/INR |
+**10 active pairs:** EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/JPY, EUR/JPY,
+EUR/CHF, USD/HKD, USD/SGD, USD/INR. All train into the single global model.
 
-The map in `src/forex_config.py` also covers USD/CAD, GBP/JPY, EUR/GBP, USD/CHF so
-it stays correct if those pairs are added later.
+> The cluster grouping below is **no longer used for modeling** (per-cluster
+> models were rolled back). It remains in `src/forex_config.py` only as reference /
+> for possible future use:
+>
+> | Cluster | Pairs |
+> |---------|-------|
+> | `usd_majors` | EUR/USD, GBP/USD |
+> | `commodity` | AUD/USD, NZD/USD |
+> | `jpy_crosses` | USD/JPY, EUR/JPY |
+> | `eur_crosses` | EUR/CHF |
+> | `usd_asia` | USD/HKD, USD/SGD, USD/INR |
 
 ---
 
@@ -165,8 +189,8 @@ it stays correct if those pairs are added later.
 ### Tables This Repo WRITES
 | Table | Purpose |
 |-------|---------|
-| `forex_ml_predictions` | Daily Buy/Sell/Hold predictions per pair (`model_name` = `forex_cluster_<cluster>`) |
-| `forex_model_performance` | Per-model training metrics (cluster identity in `model_name`) |
+| `forex_ml_predictions` | Daily **Buy/Sell** predictions per pair (`model_name` = `daily_automation_model`, `model_version` = `5.0_binary_noleak`) |
+| `forex_model_performance` | Per-model training metrics |
 
 ---
 
@@ -174,9 +198,20 @@ it stays correct if those pairs are added later.
 
 ### Key Notes
 - Forex data has DECIMAL columns (not VARCHAR like equity tables)
-- 3-class classification (Buy/Sell/Hold) — unlike equity repos which are binary
-- Multiple models trained and compared — best model selected for production
+- **Binary classification (Buy/Sell)** in production — like the equity repos
+- Multiple candidate models trained and compared — best selected for production
 - Model versioning via model_name + model_version columns in predictions table
+
+### ⚠️ Critical: row order before feature engineering (look-ahead leakage)
+`ForexSQLServerConnection.get_forex_data_with_indicators` returns rows
+**newest-first** (`ORDER BY trading_date DESC`). Any `rolling()` / `shift()`
+feature math **must** run on date-ascending data, otherwise each row's window
+peeks into its own future and the `shift(-1)` target is time-reversed — this
+silently inflated accuracy to ~80–89% and anchored predictions ~20 days stale.
+`create_advanced_features` now sorts ascending first
+(`df.sort_values('date_time')`); **do not remove that sort.** When validating,
+trust walk-forward / CV — a suspiciously high (>70%) daily-FX accuracy is the
+leakage signature.
 
 ### Testing
 ```bash
@@ -189,6 +224,8 @@ python -m pytest tests/
 ## 6. DOWNSTREAM CONSUMERS
 - **stockdata_agenticai** — Forex Agent reads `forex_ml_predictions` for daily briefing
 - **streamlit-trading-dashboard** — Displays forex predictions and trends
+- ⚠️ Signals are now **Buy/Sell only** (binary). Consumers that branched on `Hold`
+  will simply never see it; `prob_hold` is always 0.0.
 - Note: Forex is **excluded from Strategy 2 cross-analysis** (regression model underperformance)
 
 ---
