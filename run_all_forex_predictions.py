@@ -108,11 +108,10 @@ def main():
     # Process each pair
     for i, pair in enumerate(pairs):
         print(f"\n📈 Progress: {i+1}/{len(pairs)} pairs")
-
-        # Always use the pre-trained per-cluster models (each pair resolves to its
-        # cluster artifact, with the global model as fallback). No on-the-fly retrain.
-        use_existing = True
-
+        
+        # Use existing model for subsequent pairs to speed up processing
+        use_existing = i > 0
+        
         if run_prediction_for_pair(pair, use_existing_model=use_existing):
             successful_pairs.append(pair)
         else:

@@ -337,11 +337,9 @@ class ForexDailyAutomation:
                 try:
                     safe_print(f"[DATA] Processing {pair}...")
                     
-                    # Initialize predictor for this pair. Pass model_path=None so it
-                    # resolves the per-cluster model for this pair (falling back to
-                    # best_forex_model.joblib when no cluster model exists).
+                    # Initialize predictor for this pair
                     predictor = ForexTradingSignalPredictor(
-                        model_path=None,
+                        model_path='./data/best_forex_model.joblib',
                         currency_pair=pair
                     )
                     
@@ -402,11 +400,9 @@ class ForexDailyAutomation:
                 # Get model version from first prediction (all should be same)
                 model_version = combined_predictions['model_version'].iloc[0] if 'model_version' in combined_predictions.columns else '1.0'
                 
-                # model_name=None keeps the per-row cluster tag set by the
-                # forward-prediction step (e.g. forex_cluster_commodity).
                 db_success = self.results_exporter.export_predictions(
-                    combined_predictions,
-                    model_name=None,
+                    combined_predictions, 
+                    model_name='daily_automation_model',
                     model_version=model_version
                 )
                 
@@ -491,14 +487,12 @@ class ForexDailyAutomation:
                 pairs = self.db.get_forex_pairs()
                 safe_print(f"[DATA] Found {len(pairs)} currency pairs for retraining")
                 
-                # Prepare enhanced dataset — long window so each cluster has enough
-                # rows for a dedicated model (relative/strength features need the
-                # full basket; rate/yield diffs come from forex_rates_daily).
-                enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=400)
-
-                # 1) Global model (fallback for unmapped pairs)
+                # Prepare enhanced dataset — 90-day rolling window avoids stale regime bias
+                enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=90)
+                
+                # Train with 3-class prediction (BUY/SELL/HOLD) using trend signal type
                 results = trainer.train_enhanced_models(
-                    test_size=0.2,
+                    test_size=0.2, 
                     use_binary_direction=False
                 )
                 
@@ -530,24 +524,7 @@ class ForexDailyAutomation:
                             safe_print("[OK] Model performance exported to database")
                     except Exception as e:
                         safe_print(f"[WARN] Could not export model performance: {e}")
-
-                    # 2) Per-cluster models (production: each pair family learns its
-                    # own drivers, incl. rate/yield differentials). Saves
-                    # data/forex_model_<cluster>.joblib + persists metrics.
-                    try:
-                        safe_print("[INFO] Training per-cluster models...")
-                        cluster_summary = trainer.train_per_cluster(
-                            test_size=0.2, use_binary_direction=False)
-                        trained = [c for c, i in cluster_summary.items()
-                                   if not i.get('skipped')]
-                        skipped = [c for c, i in cluster_summary.items()
-                                   if i.get('skipped')]
-                        safe_print(f"[OK] Per-cluster models trained: {trained}")
-                        if skipped:
-                            safe_print(f"[INFO] Clusters skipped (too few rows): {skipped}")
-                    except Exception as e:
-                        safe_print(f"[WARN] Per-cluster training failed: {e}")
-
+                    
                     return
                 else:
                     safe_print("[WARN] Enhanced training produced no results, falling back...")
@@ -674,40 +651,20 @@ def run_weekly_job():
     safe_print("\n[OK] Weekly automation completed")
 
 
-def run_rates_job():
-    """Refresh forex_rates_daily from FRED (rate/yield-differential features)."""
-    import subprocess
-    safe_print("[INFO] Running FRED rate ingestion...")
-    try:
-        proj = os.path.dirname(os.path.abspath(__file__))
-        rc = subprocess.run(
-            [sys.executable, os.path.join('scripts', 'seed_forex_rates.py'),
-             '--days-back', '10'],
-            cwd=proj, timeout=600
-        ).returncode
-        safe_print(f"[OK] Rate ingestion finished (exit {rc})")
-    except Exception as e:
-        safe_print(f"[WARN] Rate ingestion failed: {e}")
-
-
 def main():
     """Main automation scheduler."""
     safe_print("[FOREX] Forex Daily Automation - Enhanced v3.0")
     safe_print("=" * 60)
-
-    # Schedule FRED rate ingestion at 6:00 PM (after US bond close, before predictions)
-    schedule.every().day.at("18:00").do(run_rates_job)
-
-    # Schedule daily prediction job at 8:55 PM
-    schedule.every().day.at("20:55").do(run_daily_job)
-
-    # Schedule weekly job on Sundays at 10:00 AM
-    schedule.every().sunday.at("10:00").do(run_weekly_job)
-
+    
+    # Schedule daily job at 7:00 AM
+    schedule.every().day.at("07:00").do(run_daily_job)
+    
+    # Schedule weekly job on Sundays at 6:00 AM
+    schedule.every().sunday.at("06:00").do(run_weekly_job)
+    
     safe_print("[INFO] Scheduled jobs:")
-    safe_print("  - Rate ingestion:    6:00 PM (FRED -> forex_rates_daily)")
-    safe_print("  - Daily predictions: 8:55 PM (with drift detection)")
-    safe_print("  - Weekly retraining: Sunday 10:00 AM (enhanced pipeline)")
+    safe_print("  - Daily predictions: 7:00 AM (with drift detection)")
+    safe_print("  - Weekly retraining: Sunday 6:00 AM (enhanced pipeline)")
     
     # Run immediately for testing
     if len(sys.argv) > 1 and sys.argv[1] == '--run-now':

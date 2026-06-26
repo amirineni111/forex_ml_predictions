@@ -163,13 +163,8 @@ def predict_next_day_signals(predictor, currency_pair):
             probabilities = None
         
         # Create forward-looking prediction record
-        # Tag with the per-cluster model when available (e.g. forex_cluster_commodity);
-        # fall back to the best base-model name for the global/legacy model.
-        cluster = getattr(predictor, 'model_cluster', None)
-        if cluster:
-            model_name = f'forex_cluster_{cluster}'
-        else:
-            model_name = getattr(predictor.model_manager, 'best_model_name', 'enhanced_forex_model')
+        # Get model info from predictor
+        model_name = getattr(predictor.model_manager, 'best_model_name', 'enhanced_forex_model')
         model_version = getattr(predictor, 'model_version', '3.0')
         
         prediction_df = create_forward_prediction(

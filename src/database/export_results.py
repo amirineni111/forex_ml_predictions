@@ -255,36 +255,31 @@ class ForexResultsExporter:
             logger.error(f"❌ Error recreating tables: {e}")
             return False
     
-    def export_predictions(self, predictions_df: pd.DataFrame, model_name: str = 'forex_ml_model',
+    def export_predictions(self, predictions_df: pd.DataFrame, model_name: str = 'forex_ml_model', 
                           model_version: str = '1.0') -> bool:
         """
         Export prediction results to SQL Server.
-
+        
         Args:
             predictions_df: DataFrame with prediction results
-            model_name: Name of the model used for predictions. Pass None to keep
-                a per-row `model_name` column already present in predictions_df
-                (used by the daily job to tag each pair with its cluster).
+            model_name: Name of the model used for predictions
             model_version: Version of the model
-
+            
         Returns:
             True if successful, False otherwise
         """
-
+        
         if predictions_df.empty:
             logger.warning("No predictions to export")
             return False
-
+        
         try:
             # Prepare data for export
             export_df = predictions_df.copy()
-
+            
             # Add metadata
             export_df['prediction_date'] = datetime.now()
-            # Respect a per-row model_name when the caller passes None and the
-            # predictions already carry one (per-cluster tagging); otherwise set it.
-            if not (model_name is None and 'model_name' in export_df.columns):
-                export_df['model_name'] = model_name or 'forex_ml_model'
+            export_df['model_name'] = model_name
             export_df['model_version'] = model_version
             export_df['features_used'] = len([col for col in predictions_df.columns 
                                             if col not in ['signal', 'prob_BUY', 'prob_SELL', 'prob_HOLD', 

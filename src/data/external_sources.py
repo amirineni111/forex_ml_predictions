@@ -21,15 +21,6 @@ try:
 except ImportError:
     _HAS_PYODBC = False
 
-# Structural config: external-data table names (Phase 1/2). Imported lazily so
-# this module still loads if forex_config is absent on the path.
-try:
-    from forex_config import RATES_TABLE, INTERMARKET_TABLE, ECON_EVENTS_TABLE
-except Exception:  # pragma: no cover - fallback to defaults
-    RATES_TABLE = 'forex_rates_daily'
-    INTERMARKET_TABLE = 'forex_intermarket_daily'
-    ECON_EVENTS_TABLE = 'forex_econ_events'
-
 class ExternalDataSources:
     """Collect external data that impacts forex movements"""
     
@@ -91,8 +82,8 @@ class ExternalDataSources:
         
         return self._get_sentiment_from_yfinance(start_date, end_date)
     
-    def _get_connection(self):
-        """Build a pyodbc connection from the same env vars the rest of the repo uses."""
+    def _get_sentiment_from_db(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Read market sentiment data from shared market_context_daily table."""
         server = os.getenv('SQL_SERVER', '192.168.86.28,1444')
         database = os.getenv('SQL_DATABASE', 'stockdata_db')
         driver = os.getenv('SQL_DRIVER', 'ODBC Driver 17 for SQL Server')
@@ -115,24 +106,9 @@ class ExternalDataSources:
                 f"UID={username};"
                 f"PWD={password};"
             )
-        return pyodbc.connect(conn_str)
 
-    def _table_exists(self, conn, table_name: str) -> bool:
-        """Return True if `table_name` exists in the connected database."""
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ?",
-                [table_name],
-            )
-            return cur.fetchone() is not None
-        except Exception:
-            return False
-
-    def _get_sentiment_from_db(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """Read market sentiment data from shared market_context_daily table."""
-        conn = self._get_connection()
-
+        conn = pyodbc.connect(conn_str)
+        
         query = """
         SELECT trading_date,
                vix_close, vix_change_pct,
@@ -231,174 +207,26 @@ class ExternalDataSources:
             'news_importance': 0.0        # Importance score of news events
         }
     
-    def get_rates_data(self, start_date: str, end_date: str) -> pd.DataFrame:
+    def get_intermarket_data(self, date: str) -> Dict:
         """
-        Per-currency policy rate + 2Y/10Y sovereign yields, indexed by trading_date.
-
-        Reads the shared `forex_rates_daily` table (columns: trading_date, ccy,
-        policy_rate, yield_2y, yield_10y) and pivots to WIDE form so each currency
-        becomes columns like `USD_policy_rate`, `EUR_yield_10y`, etc. — ready to
-        merge on date and difference per pair (see relative_features).
-
-        Returns an empty DataFrame (graceful) when the table or DB is unavailable;
-        callers should treat missing rate features as "not yet ingested".
+        Get intermarket relationships that affect forex
+        
+        Key relationships:
+        1. Bond yield differentials
+        2. Commodity currencies correlation
+        3. Risk-on/Risk-off sentiment
+        4. Cross-currency correlations
         """
-        if not self.use_db:
-            return pd.DataFrame()
-        try:
-            conn = self._get_connection()
-            if not self._table_exists(conn, RATES_TABLE):
-                conn.close()
-                print(f"[INFO] {RATES_TABLE} not present — skipping rate/yield features")
-                return pd.DataFrame()
-
-            query = f"""
-            SELECT trading_date, ccy, policy_rate, yield_2y, yield_10y
-            FROM dbo.{RATES_TABLE}
-            WHERE trading_date >= ? AND trading_date <= ?
-            ORDER BY trading_date
-            """
-            df = pd.read_sql(query, conn, params=[start_date, end_date],
-                             parse_dates=['trading_date'])
-            conn.close()
-            if df.empty:
-                return pd.DataFrame()
-
-            wide = df.pivot_table(index='trading_date', columns='ccy',
-                                  values=['policy_rate', 'yield_2y', 'yield_10y'])
-            # Flatten MultiIndex columns: ('yield_10y','USD') -> 'USD_yield_10y'
-            wide.columns = [f'{ccy}_{field}' for field, ccy in wide.columns]
-            wide = wide.sort_index().ffill()
-            print(f"  [OK] Rates from DB: {len(wide)} rows, {wide.shape[1]} columns")
-            return wide
-        except Exception as e:
-            print(f"[WARN] Could not read {RATES_TABLE}: {e}")
-            return pd.DataFrame()
-
-    def get_intermarket_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """
-        Intermarket relationships that affect forex, indexed by trading_date.
-
-        Columns: gold/oil/copper closes + returns, commodity index, EM-FX index,
-        risk_on_sentiment. Prefers the shared `forex_intermarket_daily` table;
-        falls back to yfinance for gold/oil/copper so training still gets a signal.
-
-        NOTE: signature changed from a single-date dict to a date-range DataFrame
-        so it merges on date like get_market_sentiment_data.
-        """
-        # 1. Preferred: shared DB table
-        if self.use_db:
-            try:
-                conn = self._get_connection()
-                if self._table_exists(conn, INTERMARKET_TABLE):
-                    query = f"""
-                    SELECT trading_date, gold_close, oil_close, copper_close,
-                           commodity_index, em_currency_index, risk_on_sentiment
-                    FROM dbo.{INTERMARKET_TABLE}
-                    WHERE trading_date >= ? AND trading_date <= ?
-                    ORDER BY trading_date
-                    """
-                    df = pd.read_sql(query, conn, params=[start_date, end_date],
-                                     parse_dates=['trading_date'])
-                    conn.close()
-                    if not df.empty:
-                        df = df.set_index('trading_date').sort_index()
-                        for c in ['gold_close', 'oil_close', 'copper_close']:
-                            if c in df.columns:
-                                base = c.replace('_close', '')
-                                df[f'{base}_return_1d'] = df[c].pct_change()
-                                df[f'{base}_return_5d'] = df[c].pct_change(5)
-                        print(f"  [OK] Intermarket from DB: {len(df)} rows")
-                        return df
-                else:
-                    conn.close()
-            except Exception as e:
-                print(f"[WARN] Could not read {INTERMARKET_TABLE}: {e}; trying yfinance")
-
-        # 2. Fallback: yfinance for commodities
-        return self._get_intermarket_from_yfinance(start_date, end_date)
-
-    def _get_intermarket_from_yfinance(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """Fallback commodity/intermarket proxies from yfinance (never raises)."""
-        tickers = {'gold': 'GC=F', 'oil': 'CL=F', 'copper': 'HG=F'}
-        out = {}
-        for name, ticker in tickers.items():
-            try:
-                data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                if data is None or data.empty or 'Close' not in data.columns:
-                    continue
-                close = data['Close']
-                # Newer yfinance can return a 1-col DataFrame for Close — squeeze it
-                if isinstance(close, pd.DataFrame):
-                    close = close.iloc[:, 0]
-                close = pd.Series(close).astype(float)
-                if close.empty:
-                    continue
-                out[f'{name}_close'] = close
-                out[f'{name}_return_1d'] = close.pct_change()
-                out[f'{name}_return_5d'] = close.pct_change(5)
-            except Exception as e:
-                print(f"[WARN] intermarket {name} download failed: {e}")
-        if not out:
-            return pd.DataFrame()
-        try:
-            df = pd.DataFrame(out)
-            df.index = pd.to_datetime(df.index)
-            return df.sort_index()
-        except Exception as e:
-            print(f"[WARN] intermarket assembly failed: {e}")
-            return pd.DataFrame()
-
-    def get_econ_events(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """
-        Daily macro-event flags per currency, indexed by trading_date.
-
-        Reads `forex_econ_events` (event_date, ccy, event_type, importance) and
-        derives, per date, per-currency flags the model can consume:
-          <CCY>_is_cb_meeting, <CCY>_is_cpi, <CCY>_is_nfp, <CCY>_event_importance,
-          <CCY>_days_to_cb_meeting
-        Returns empty DataFrame when the table/DB is unavailable.
-        """
-        if not self.use_db:
-            return pd.DataFrame()
-        try:
-            conn = self._get_connection()
-            if not self._table_exists(conn, ECON_EVENTS_TABLE):
-                conn.close()
-                print(f"[INFO] {ECON_EVENTS_TABLE} not present — skipping event features")
-                return pd.DataFrame()
-
-            query = f"""
-            SELECT event_date, ccy, event_type, importance
-            FROM dbo.{ECON_EVENTS_TABLE}
-            WHERE event_date >= ? AND event_date <= ?
-            ORDER BY event_date
-            """
-            ev = pd.read_sql(query, conn, params=[start_date, end_date],
-                             parse_dates=['event_date'])
-            conn.close()
-            if ev.empty:
-                return pd.DataFrame()
-
-            ev['event_type'] = ev['event_type'].str.upper()
-            frames = []
-            for ccy, grp in ev.groupby('ccy'):
-                g = grp.set_index('event_date')
-                daily = pd.DataFrame(index=g.index.unique())
-                daily[f'{ccy}_is_cb_meeting'] = g['event_type'].eq('CB_MEETING').groupby(level=0).max().astype(int)
-                daily[f'{ccy}_is_cpi'] = g['event_type'].eq('CPI').groupby(level=0).max().astype(int)
-                daily[f'{ccy}_is_nfp'] = g['event_type'].eq('NFP').groupby(level=0).max().astype(int)
-                daily[f'{ccy}_event_importance'] = g['importance'].groupby(level=0).max()
-                frames.append(daily)
-
-            if not frames:
-                return pd.DataFrame()
-            out = pd.concat(frames, axis=1).sort_index().fillna(0)
-            print(f"  [OK] Econ events from DB: {len(out)} dated rows")
-            return out
-        except Exception as e:
-            print(f"[WARN] Could not read {ECON_EVENTS_TABLE}: {e}")
-            return pd.DataFrame()
+        
+        intermarket_features = {
+            'yield_spread_us_de': 0.0,    # US-Germany 10Y yield spread
+            'yield_spread_us_jp': 0.0,    # US-Japan 10Y yield spread
+            'risk_on_sentiment': 0.0,     # Risk appetite measure
+            'commodity_index': 0.0,       # Commodity price index
+            'em_currency_index': 0.0      # Emerging market currency index
+        }
+        
+        return intermarket_features
     
     def get_technical_regime_data(self, currency_pair: str) -> Dict:
         """

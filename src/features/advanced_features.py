@@ -42,7 +42,17 @@ class AdvancedForexFeatures:
             DataFrame with advanced engineered features
         """
         df_enhanced = df.copy()
-        
+
+        # Ensure chronological (ascending) order BEFORE any rolling/shift math.
+        # The DB returns rows newest-first (connection.py: ORDER BY trading_date
+        # DESC). Computing rolling() on that order dumps each window's warm-up
+        # NaNs onto the most RECENT rows (so the predictor drops fresh data and
+        # falls ~20 days behind) and reverses time for shift()-based features and
+        # the downstream shift(-1) target. Sorting ascending here makes features
+        # and target forward-in-time for both the training and prediction paths.
+        if 'date_time' in df_enhanced.columns:
+            df_enhanced = df_enhanced.sort_values('date_time').reset_index(drop=True)
+
         # Ensure we have required columns
         required_cols = ['close_price', 'high_price', 'low_price', 'open_price']
         missing_cols = [col for col in required_cols if col not in df_enhanced.columns]
