@@ -21,17 +21,49 @@ try:
 except ImportError:
     _HAS_PYODBC = False
 
+# Cache shared across instances: the daily run constructs a fresh predictor
+# (and ExternalDataSources) per pair, so an instance-level cache would never
+# hit. Keyed by (source, start_date, end_date).
+_SHARED_CACHE = {}
+
+
 class ExternalDataSources:
     """Collect external data that impacts forex movements"""
-    
+
     def __init__(self, use_db=True):
         """
         Args:
             use_db: If True, read market sentiment from shared market_context_daily table
                     in SQL Server (faster, no rate limits). Falls back to yfinance if unavailable.
         """
-        self.data_cache = {}
+        self.data_cache = _SHARED_CACHE
         self.use_db = use_db and _HAS_PYODBC
+
+    def _get_db_connection(self):
+        """Open a pyodbc connection using the .env SQL settings."""
+        server = os.getenv('SQL_SERVER', '192.168.86.28,1444')
+        database = os.getenv('SQL_DATABASE', 'stockdata_db')
+        driver = os.getenv('SQL_DRIVER', 'ODBC Driver 17 for SQL Server')
+        username = os.getenv('SQL_USERNAME', '')
+        password = os.getenv('SQL_PASSWORD', '')
+        trusted = os.getenv('SQL_TRUSTED_CONNECTION', 'no').lower() == 'yes'
+
+        if trusted:
+            conn_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={server};"
+                f"DATABASE={database};"
+                f"Trusted_Connection=yes;"
+            )
+        else:
+            conn_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={server};"
+                f"DATABASE={database};"
+                f"UID={username};"
+                f"PWD={password};"
+            )
+        return pyodbc.connect(conn_str)
     
     def get_economic_indicators(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -72,43 +104,93 @@ class ExternalDataSources:
         This is faster and avoids yfinance rate limits during training.
         """
         
+        cache_key = ('sentiment', start_date, end_date, self.use_db)
+        if cache_key in self.data_cache:
+            return self.data_cache[cache_key]
+
         # Try reading from shared database table first
         if self.use_db:
             try:
-                return self._get_sentiment_from_db(start_date, end_date)
+                result = self._get_sentiment_from_db(start_date, end_date)
+                self.data_cache[cache_key] = result
+                return result
             except Exception as e:
                 print(f"[WARN] Could not read market context from DB: {e}")
                 print("[INFO] Falling back to yfinance download...")
-        
-        return self._get_sentiment_from_yfinance(start_date, end_date)
-    
+
+        result = self._get_sentiment_from_yfinance(start_date, end_date)
+        self.data_cache[cache_key] = result
+        return result
+
+    def get_rates_data(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Read forex_rates_daily (FRED-seeded policy rate + 2Y/10Y yields).
+
+        The table is long format keyed by (trading_date, ccy). Returns a WIDE
+        frame indexed by trading_date with columns '{CCY}_policy_rate',
+        '{CCY}_yield_2y', '{CCY}_yield_10y', forward-filled (limit=25 business
+        days) — the non-US 10Y series are monthly FRED/OECD data published
+        with up to ~1 month lag, so the tail must carry the last known level.
+        Fetches ~45 extra calendar days before start_date so downstream
+        .diff(5/20) features have history at the window head.
+
+        Currencies absent from the table (e.g. HKD/SGD/INR — no FRED series)
+        simply have no columns; consumers must be NaN-tolerant. Returns an
+        empty frame (with a [WARN]) if the table is missing or unreadable.
+        """
+        cache_key = ('rates', start_date, end_date)
+        if cache_key in self.data_cache:
+            return self.data_cache[cache_key]
+
+        if not self.use_db:
+            print("[WARN] Rates data requires DB access (no yfinance fallback)")
+            return pd.DataFrame()
+
+        try:
+            import forex_config
+            table = forex_config.RATES_TABLE
+        except ImportError:
+            table = 'forex_rates_daily'
+
+        try:
+            # Buffer so diff(20) features are defined from start_date onward
+            query_start = (pd.to_datetime(start_date) - timedelta(days=45)).strftime('%Y-%m-%d')
+
+            conn = self._get_db_connection()
+            query = f"""
+            SELECT trading_date, ccy, policy_rate, yield_2y, yield_10y
+            FROM {table}
+            WHERE trading_date >= ? AND trading_date <= ?
+            ORDER BY trading_date
+            """
+            df = pd.read_sql(query, conn, params=[query_start, end_date],
+                             parse_dates=['trading_date'])
+            conn.close()
+
+            if df.empty:
+                print(f"[WARN] No rows in {table} for {query_start}..{end_date}")
+                return pd.DataFrame()
+
+            for col in ['policy_rate', 'yield_2y', 'yield_10y']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            wide = df.pivot(index='trading_date', columns='ccy',
+                            values=['policy_rate', 'yield_2y', 'yield_10y'])
+            wide.columns = [f'{ccy}_{field}' for field, ccy in wide.columns]
+            wide = wide.sort_index().ffill(limit=25)
+
+            print(f"  [OK] Rates from {table}: {len(wide)} rows, "
+                  f"{len(wide.columns)} currency-field columns")
+            self.data_cache[cache_key] = wide
+            return wide
+
+        except Exception as e:
+            print(f"[WARN] Could not read {table}: {e}")
+            return pd.DataFrame()
+
     def _get_sentiment_from_db(self, start_date: str, end_date: str) -> pd.DataFrame:
         """Read market sentiment data from shared market_context_daily table."""
-        server = os.getenv('SQL_SERVER', '192.168.86.28,1444')
-        database = os.getenv('SQL_DATABASE', 'stockdata_db')
-        driver = os.getenv('SQL_DRIVER', 'ODBC Driver 17 for SQL Server')
-        username = os.getenv('SQL_USERNAME', '')
-        password = os.getenv('SQL_PASSWORD', '')
-        trusted = os.getenv('SQL_TRUSTED_CONNECTION', 'no').lower() == 'yes'
+        conn = self._get_db_connection()
 
-        if trusted:
-            conn_str = (
-                f"DRIVER={{{driver}}};"
-                f"SERVER={server};"
-                f"DATABASE={database};"
-                f"Trusted_Connection=yes;"
-            )
-        else:
-            conn_str = (
-                f"DRIVER={{{driver}}};"
-                f"SERVER={server};"
-                f"DATABASE={database};"
-                f"UID={username};"
-                f"PWD={password};"
-            )
-
-        conn = pyodbc.connect(conn_str)
-        
         query = """
         SELECT trading_date,
                vix_close, vix_change_pct,

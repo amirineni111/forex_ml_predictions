@@ -26,6 +26,7 @@ from database.connection import ForexSQLServerConnection
 from features.advanced_features import AdvancedForexFeatures
 from models.advanced_models import AdvancedForexModels
 from data.external_sources import ExternalDataSources
+import forex_config
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -59,19 +60,24 @@ class EnhancedForexTrainer:
         self.external_data = ExternalDataSources()
         self.enhanced_features_df = None
         self.feature_quality = None
+        self.include_rates = None  # None -> forex_config.INCLUDE_RATES_FEATURES
         
-    def prepare_enhanced_dataset(self, currency_pairs: list = None, lookback_days: int = 90) -> pd.DataFrame:
+    def prepare_enhanced_dataset(self, currency_pairs: list = None, lookback_days: int = 90,
+                                 include_rates: bool = None) -> pd.DataFrame:
         """
         Prepare enhanced dataset with all available features.
-        
+
         Enhanced with better data quality checks and feature engineering.
+        include_rates toggles the forex_rates_daily differential features
+        (None = forex_config.INCLUDE_RATES_FEATURES).
         """
-        
+
         safe_print("[INFO] Preparing enhanced dataset for training...")
-        
+
+        self.include_rates = include_rates
+
         if currency_pairs is None:
-            currency_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
-                            'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'GBPJPY']
+            currency_pairs = forex_config.DEFAULT_PAIRS
         
         all_data = []
         
@@ -129,24 +135,48 @@ class EnhancedForexTrainer:
         self.enhanced_features_df = combined_data
         return combined_data
     
+    def train_production_model(self, pairs: list = None, include_rates: bool = None,
+                               save_artifact: bool = True) -> dict:
+        """Canonical production training entry point.
+
+        Fetches the live pair list from the DB, trains the binary-direction
+        model on the configured lookback window, and saves the artifact. ALL
+        production retrains (manual, weekly scheduled, drift-triggered) must
+        go through this method so the training configuration cannot drift —
+        see forex_config for the constants and the history of why.
+
+        include_rates / save_artifact exist for the A/B comparison script
+        (scripts/compare_rates_features.py); production callers leave them
+        at their defaults.
+        """
+        if pairs is None:
+            try:
+                pairs = self.db.get_forex_pairs()
+            except Exception as e:
+                safe_print(f"[WARN] Could not fetch live pair list ({e}); using DEFAULT_PAIRS")
+                pairs = None
+        if not pairs:
+            pairs = forex_config.DEFAULT_PAIRS
+
+        safe_print(f"[INFO] Production training on {len(pairs)} pairs: {', '.join(pairs)}")
+        self.prepare_enhanced_dataset(pairs, lookback_days=forex_config.TRAINING_LOOKBACK_DAYS,
+                                      include_rates=include_rates)
+        return self.train_enhanced_models(
+            test_size=forex_config.TRAINING_TEST_SIZE,
+            use_binary_direction=forex_config.USE_BINARY_DIRECTION,
+            save_artifact=save_artifact
+        )
+
     def _add_external_features(self, df: pd.DataFrame, currency_pair: str) -> pd.DataFrame:
-        """Add external market features."""
-        try:
-            if 'date_time' in df.columns:
-                start_date = df['date_time'].min().strftime('%Y-%m-%d')
-                end_date = df['date_time'].max().strftime('%Y-%m-%d')
-                
-                # Get market sentiment data
-                sentiment_data = self.external_data.get_market_sentiment_data(start_date, end_date)
-                
-                if not sentiment_data.empty:
-                    df_with_sentiment = df.merge(sentiment_data, left_on='date_time', 
-                                                right_index=True, how='left')
-                    return df_with_sentiment
-        except Exception as e:
-            logger.warning(f"Error adding external features for {currency_pair}: {e}")
-        
-        return df
+        """Add external market features via the SHARED train/serve merge.
+
+        Never merge external data directly here — predict_forex_signals.
+        prepare_features() calls the same add_external_features(), which is
+        what keeps training and serving feature sets identical.
+        """
+        from features.external_merge import add_external_features
+        return add_external_features(df, currency_pair, self.external_data,
+                                     include_rates=self.include_rates)
     
     def _merge_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Load calendar features (bank holidays, short weeks) and merge on date.
@@ -268,15 +298,18 @@ class EnhancedForexTrainer:
         
         safe_print("")
     
-    def train_enhanced_models(self, test_size: float = 0.2, 
-                             use_binary_direction: bool = False) -> dict:
+    def train_enhanced_models(self, test_size: float = 0.2,
+                             use_binary_direction: bool = False,
+                             save_artifact: bool = True) -> dict:
         """
         Train enhanced models with all improvements.
-        
+
         Args:
             test_size: Fraction of data for testing
             use_binary_direction: If False, use 3-class BUY/SELL/HOLD prediction (recommended to fix SELL bias)
-        
+            save_artifact: If False, train and evaluate but do NOT overwrite the
+                model files (used by A/B comparison runs)
+
         Key improvements:
         - Binary direction prediction for better accuracy
         - Walk-forward validation
@@ -311,9 +344,12 @@ class EnhancedForexTrainer:
         X = valid_data[feature_columns].copy()
         y = valid_data[target_col].copy()
         
-        # Handle missing and infinite values
+        # Handle missing and infinite values. Keep the medians: they are saved
+        # in the model artifact so the predict paths fill NaN with the SAME
+        # values (median-fill at train + zero-fill at serve = silent skew).
         X = X.replace([np.inf, -np.inf], np.nan)
-        X = X.fillna(X.median())
+        fill_values = X.median()
+        X = X.fillna(fill_values)
         
         safe_print(f"[DATA] Training with {len(feature_columns)} features on {len(X)} samples")
         safe_print(f"[DATA] Target distribution: {y.value_counts().to_dict()}")
@@ -372,15 +408,25 @@ class EnhancedForexTrainer:
         if not stability_ok:
             safe_print("[WARN] Model stability check failed. Consider more data or simpler models.")
         
-        # Save enhanced model
-        self._save_enhanced_model(
-            best_model, best_model_name, 
-            X_selected.columns.tolist(), 
-            label_encoder, results, 
-            self.model_trainer.scaler,
-            wf_results
-        )
-        
+        # Fill values restricted to the features the model actually uses
+        feature_fill_values = {
+            col: float(fill_values[col])
+            for col in X_selected.columns if col in fill_values.index and pd.notna(fill_values[col])
+        }
+
+        # Save enhanced model (skipped for A/B comparison runs)
+        if save_artifact:
+            self._save_enhanced_model(
+                best_model, best_model_name,
+                X_selected.columns.tolist(),
+                label_encoder, results,
+                self.model_trainer.scaler,
+                wf_results,
+                feature_fill_values=feature_fill_values
+            )
+        else:
+            safe_print("[INFO] save_artifact=False - model files NOT updated")
+
         return {
             'best_model': best_model,
             'best_model_name': best_model_name,
@@ -390,7 +436,8 @@ class EnhancedForexTrainer:
             'feature_columns': X_selected.columns.tolist(),
             'label_encoder': label_encoder,
             'scaler': self.model_trainer.scaler,
-            'stability_passed': stability_ok
+            'stability_passed': stability_ok,
+            'feature_fill_values': feature_fill_values
         }
     
     def _select_feature_columns(self) -> list:
@@ -619,7 +666,7 @@ class EnhancedForexTrainer:
     
     def _save_enhanced_model(self, model, model_name: str, feature_columns: list,
                            label_encoder, all_results: dict, scaler=None,
-                           wf_results: dict = None):
+                           wf_results: dict = None, feature_fill_values: dict = None):
         """Save the enhanced model with all artifacts."""
         
         import joblib
@@ -636,10 +683,11 @@ class EnhancedForexTrainer:
             'scaler': scaler,
             'feature_columns': feature_columns,
             'label_encoder': label_encoder,
+            'feature_fill_values': feature_fill_values or {},
             'training_results': all_results,
             'walk_forward_results': wf_results,
             'training_date': datetime.now().isoformat(),
-            'model_version': '5.0_binary_noleak',
+            'model_version': forex_config.MODEL_VERSION,
             'improvements': [
                 'binary_direction_prediction',
                 'adaptive_thresholds',
@@ -667,36 +715,31 @@ def main():
     """Main training function."""
     
     safe_print("=" * 70)
-    safe_print("  ENHANCED FOREX ML TRAINING - 3-Class Signal Optimizer")
+    safe_print("  ENHANCED FOREX ML TRAINING - Binary Direction (UP/DOWN)")
     safe_print("=" * 70)
     safe_print("")
-    
+
     try:
         # Initialize trainer
         trainer = EnhancedForexTrainer()
-        
+
         # Test database connection
         if not trainer.db.test_connection():
             safe_print("[ERROR] Database connection failed")
             return
-        
+
         safe_print("[OK] Database connection established")
-        
-        # Prepare enhanced dataset
-        currency_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
-        safe_print(f"[INFO] Training on currency pairs: {', '.join(currency_pairs)}")
-        
-        enhanced_data = trainer.prepare_enhanced_dataset(currency_pairs, lookback_days=400)
 
         # Train with BINARY direction (UP/DOWN -> BUY/SELL). The 3-class
         # BUY/HOLD/SELL target proved unlearnable here (walk-forward ~41.5% vs a
         # 41% majority-class baseline = no edge), whereas binary direction has a
         # real out-of-sample edge (walk-forward ~61.7% vs 50% coin-flip, stability
-        # PASSED). 400-day lookback gives each model enough history.
+        # PASSED). Live pair list + 400-day lookback come from
+        # train_production_model / forex_config.
         safe_print("\n" + "=" * 70)
         safe_print("  TRAINING WITH BINARY DIRECTION (UP/DOWN -> BUY/SELL)")
         safe_print("=" * 70)
-        results = trainer.train_enhanced_models(test_size=0.2, use_binary_direction=True)
+        results = trainer.train_production_model()
         
         if not results:
             safe_print("[ERROR] Training produced no results")

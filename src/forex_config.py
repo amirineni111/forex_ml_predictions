@@ -28,6 +28,26 @@ DEFAULT_PAIRS: List[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Production training configuration (single source of truth).
+# ALL production retrains (manual `python train_enhanced_model.py`, the weekly
+# scheduled retrain, drift-triggered retrains) must go through
+# EnhancedForexTrainer.train_production_model(), which reads these constants.
+# Never call prepare_enhanced_dataset/train_enhanced_models directly with
+# ad-hoc arguments for production — a weekly retrain that quietly used
+# use_binary_direction=False + lookback_days=90 is exactly how the 2026-06-28
+# 3-class model regression reached production.
+# ---------------------------------------------------------------------------
+TRAINING_LOOKBACK_DAYS = 400   # binary model needs long history; 90d = regime bias
+USE_BINARY_DIRECTION = True    # 3-class BUY/HOLD/SELL has no edge (~41.5% WF vs 41% baseline)
+TRAINING_TEST_SIZE = 0.2
+# Rate-differential features from forex_rates_daily. Accepted by
+# scripts/compare_rates_features.py on 2026-07-04 (WF 0.6256 vs 0.6241
+# baseline; rate_yield_10y_diff_chg_5d/_chg_20d survived feature selection).
+# Re-run the A/B before flipping this either way.
+INCLUDE_RATES_FEATURES = True
+MODEL_VERSION = '5.2_binary_rates'
+
+# ---------------------------------------------------------------------------
 # Per-cluster model mapping (Phase 4).
 # Each pair maps to EXACTLY ONE cluster so it trains in exactly one model.
 #   usd_majors  — USD strength / Fed / DXY driven (EUR/USD, GBP/USD)
