@@ -14,20 +14,34 @@ from datetime import datetime, timedelta
 import sys
 import os
 
+try:
+    from .signal_policy import apply_signal_thresholds, technical_veto, gate_binary_signal
+except ImportError:  # imported without package context (e.g. sys.path points at src/utils)
+    from signal_policy import apply_signal_thresholds, technical_veto, gate_binary_signal
 
-def create_forward_prediction(df_recent, predictions, probabilities, currency_pair, 
-                            model_name='enhanced_forex_model', model_version='3.0'):
+
+def create_forward_prediction(df_recent, predictions, probabilities, currency_pair,
+                            model_name='enhanced_forex_model', model_version='3.0',
+                            label_classes=None):
     """
     Create forward-looking prediction for next trading day.
-    
+
+    Applies the shared signal policy (asymmetric thresholds + technical veto,
+    src/utils/signal_policy.py) so the scheduled daily run enforces the same
+    rules as predict_forex_signals.py. 'HOLD' in the output means the model
+    ABSTAINED (no side cleared its threshold, or a SELL was vetoed) — it is
+    not a predicted class of the binary model, and prob_hold stays 0.0.
+
     Args:
         df_recent: Most recent market data (today)
-        predictions: Model predictions 
+        predictions: Model predictions
         probabilities: Prediction probabilities
         currency_pair: Currency pair symbol
         model_name: Name of the model used
         model_version: Version of the model used
-    
+        label_classes: The model's label_encoder.classes_ — used to map
+            probability columns by class NAME instead of assuming positions
+
     Returns:
         DataFrame with tomorrow's prediction
     """
@@ -58,11 +72,16 @@ def create_forward_prediction(df_recent, predictions, probabilities, currency_pa
         estimated_high = current_high
         estimated_low = current_low
     
-    # Map direction predictions to signals
+    # Map direction predictions to signals (raw argmax; may be overridden by the
+    # signal policy below when probabilities are available)
     raw_signal = predictions[0]
     signal_mapping = {'UP': 'BUY', 'DOWN': 'SELL'}
     predicted_signal = signal_mapping.get(raw_signal, raw_signal)
-    
+
+    # Mark the artifact as policy-gated in the version string
+    if 'gated' not in str(model_version):
+        model_version = f"{model_version}+gated"
+
     # Create prediction record for TOMORROW
     prediction_record = {
         'prediction_date': tomorrow,
@@ -77,29 +96,68 @@ def create_forward_prediction(df_recent, predictions, probabilities, currency_pa
         'signal_confidence': 0.0,
         'model_name': model_name,
         'model_version': model_version,
-        'features_used': 'technical_indicators_enhanced'
+        'features_used': 'technical_indicators_enhanced',
+        'gate_reason': 'ungated',  # transient; exporter whitelists table columns
     }
-    
-    # Add probability columns if available
+
+    # Add probability columns and apply the shared signal policy
     if probabilities is not None and len(probabilities.shape) > 1:
-        # Get class names from probabilities
         n_classes = probabilities.shape[1]
-        
+        probs = probabilities[0]
+
+        # Resolve class names from the model's label encoder rather than
+        # assuming positions (LabelEncoder happens to sort alphabetically
+        # today, but nothing guarantees a given artifact's order).
+        if label_classes is not None and len(label_classes) == n_classes:
+            classes = [str(c).upper() for c in label_classes]
+        elif n_classes == 2:
+            classes = ['DOWN', 'UP']
+        else:
+            classes = ['BUY', 'HOLD', 'SELL'][:n_classes]
+
+        prob_by_class = {c: float(p) for c, p in zip(classes, probs)}
+        today_row = df_recent.iloc[0]
+
         if n_classes == 2:
-            # Binary direction model (DOWN, UP)
-            prediction_record['prob_sell'] = float(probabilities[0][0])
-            prediction_record['prob_buy'] = float(probabilities[0][1])
-            prediction_record['prob_hold'] = 0.0
-        elif n_classes == 3:
-            # 3-class model (BUY, HOLD, SELL) or alphabetical order
-            prob_cols = ['BUY', 'HOLD', 'SELL']
-            for i, col in enumerate(prob_cols):
-                if i < n_classes:
-                    prediction_record[f'prob_{col.lower()}'] = float(probabilities[0][i])
-        
-        # Calculate confidence as max probability
-        prediction_record['signal_confidence'] = float(np.max(probabilities[0]))
-    
+            # Binary direction model: DOWN -> SELL side, UP -> BUY side.
+            prob_sell = prob_by_class.get('DOWN', 0.0)
+            prob_buy = prob_by_class.get('UP', 0.0)
+            prediction_record['prob_sell'] = prob_sell
+            prediction_record['prob_buy'] = prob_buy
+            prediction_record['prob_hold'] = 0.0  # HOLD = abstain, never a class here
+
+            gated_signal, gate_reason = gate_binary_signal(prob_buy, prob_sell, today_row)
+        else:
+            # 3-class artifact (defensive: e.g. an old model restored from backup)
+            prediction_record['prob_buy'] = prob_by_class.get('BUY', 0.0)
+            prediction_record['prob_hold'] = prob_by_class.get('HOLD', 0.0)
+            prediction_record['prob_sell'] = prob_by_class.get('SELL', 0.0)
+
+            thresholded = apply_signal_thresholds({
+                'BUY': prediction_record['prob_buy'],
+                'HOLD': prediction_record['prob_hold'],
+                'SELL': prediction_record['prob_sell'],
+            })
+            gated_signal = technical_veto(thresholded, today_row)
+            if gated_signal != thresholded:
+                gate_reason = 'veto'
+            elif gated_signal == 'HOLD' and predicted_signal != 'HOLD':
+                gate_reason = 'abstain'
+            else:
+                gate_reason = 'threshold'
+
+        if gated_signal != predicted_signal:
+            print(f"[INFO] {currency_pair}: gated {predicted_signal} -> {gated_signal} "
+                  f"(buy={prediction_record.get('prob_buy', 0):.3f}, "
+                  f"sell={prediction_record.get('prob_sell', 0):.3f}, reason={gate_reason})")
+
+        prediction_record['predicted_signal'] = gated_signal
+        prediction_record['gate_reason'] = gate_reason
+
+        # Confidence stays the max class probability even when abstaining, so a
+        # 0.60/0.40 abstain is distinguishable from a 0.51/0.49 one downstream.
+        prediction_record['signal_confidence'] = float(np.max(probs))
+
     return pd.DataFrame([prediction_record])
 
 
@@ -127,8 +185,18 @@ def predict_next_day_signals(predictor, currency_pair):
             print("[ERROR] Insufficient features for prediction") 
             return pd.DataFrame()
         
-        # Get the MOST RECENT record (today's data)
+        # Get the MOST RECENT record (today's data). Features that are
+        # structurally NaN for some pairs (e.g. rate_* diffs for currencies
+        # with no FRED coverage: HKD/SGD/INR) are median-filled here exactly
+        # as in training — the fill must happen BEFORE the dropna row filter,
+        # otherwise those pairs lose every row and get no prediction.
         df_features = df_features.sort_values('date_time')
+        fill_values = getattr(predictor, 'feature_fill_values', None) or {}
+        if fill_values:
+            fillable = [c for c in available_features
+                        if c in df_features.columns and c in fill_values]
+            if fillable:
+                df_features[fillable] = df_features[fillable].fillna(pd.Series(fill_values))
         df_today = df_features.dropna(subset=available_features).tail(1)
         
         if df_today.empty:
@@ -150,9 +218,15 @@ def predict_next_day_signals(predictor, currency_pair):
         
         print(f"[DATA] Using data from: {latest_date} to predict NEXT trading day")
         
-        # Make prediction for TOMORROW using TODAY's data
+        # Make prediction for TOMORROW using TODAY's data. NaN fill uses the
+        # training-time medians from the artifact (fill-value parity); 0 only
+        # as last resort for pre-5.1 artifacts without feature_fill_values.
         X_pred = df_today[available_features].copy()
-        X_pred = X_pred.replace([np.inf, -np.inf], np.nan).fillna(0)
+        X_pred = X_pred.replace([np.inf, -np.inf], np.nan)
+        fill_values = getattr(predictor, 'feature_fill_values', None) or {}
+        if fill_values:
+            X_pred = X_pred.fillna(pd.Series(fill_values))
+        X_pred = X_pred.fillna(0)
         
         predictions = predictor.model_manager.predict(X_pred)
         
@@ -166,10 +240,14 @@ def predict_next_day_signals(predictor, currency_pair):
         # Get model info from predictor
         model_name = getattr(predictor.model_manager, 'best_model_name', 'enhanced_forex_model')
         model_version = getattr(predictor, 'model_version', '3.0')
-        
+
+        label_encoder = getattr(predictor.model_manager, 'label_encoder', None)
+        label_classes = getattr(label_encoder, 'classes_', None)
+
         prediction_df = create_forward_prediction(
             df_today, predictions, probabilities, currency_pair,
-            model_name=model_name, model_version=model_version
+            model_name=model_name, model_version=model_version,
+            label_classes=label_classes
         )
         
         signal = prediction_df['predicted_signal'].iloc[0]

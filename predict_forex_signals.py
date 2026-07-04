@@ -25,6 +25,8 @@ sys.path.append(os.path.join(os.getcwd(), 'src'))
 from database.connection import ForexSQLServerConnection
 from database.export_results import ForexResultsExporter
 from models.ml_models import ForexMLModelManager
+from data.external_sources import ExternalDataSources
+from features.external_merge import add_external_features
 
 warnings.filterwarnings('ignore')
 
@@ -34,66 +36,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# ---------------------------------------------------------------------------
-# FIX 1: Asymmetric signal thresholds
-# SELL was over-predicted (only 32-44% accurate at high confidence).
-# Raise its bar so the model only fires SELL when it is very sure.
-# ---------------------------------------------------------------------------
-SIGNAL_THRESHOLDS = {
-    'BUY':  0.55,   # BUY accuracy is solid — minor raise
-    'SELL': 0.75,   # SELL is chronically over-predicted — raise significantly
-    'HOLD': 0.50,   # neutral baseline
-}
-
-
-def apply_signal_thresholds(prob_map: dict) -> str:
-    """
-    Convert raw class probabilities to a signal using asymmetric thresholds.
-
-    Falls back to 'HOLD' when no class clears its threshold (no conviction).
-    """
-    candidates = {
-        sig: prob for sig, prob in prob_map.items()
-        if prob >= SIGNAL_THRESHOLDS.get(sig, 0.50)
-    }
-    if not candidates:
-        return 'HOLD'
-    return max(candidates, key=candidates.get)
-
-
-# ---------------------------------------------------------------------------
-# FIX 3: Technical veto layer
-# Pattern B: RSI<55, MACD<0, price<SMA20, BB%<40 → SELL accuracy only 37%.
-# When all 4 conditions hold, demote SELL → HOLD.
-# ---------------------------------------------------------------------------
-def technical_veto(signal: str, row: 'pd.Series') -> str:
-    """
-    Suppress SELL signals when technical indicators contradict the bearish call.
-    Only SELL signals are evaluated — BUY and HOLD pass through unchanged.
-    """
-    if signal != 'SELL':
-        return signal
-
-    rsi    = float(row.get('rsi_14', 50) or 50)
-    macd   = float(row.get('macd',    0) or 0)
-    close  = float(row.get('close_price', 0) or 0)
-    sma20  = float(row.get('sma_20',  close) or close)
-    bb_pct = float(row.get('bb_percent', 50) or 50)   # 0–1 scale from prepare_features
-
-    # bb_percent is stored as 0–1 ratio; convert to 0–100 if needed
-    if bb_pct <= 1.0:
-        bb_pct *= 100.0
-
-    pattern_b = (
-        rsi   < 55    and
-        macd  < 0     and
-        close < sma20 and
-        bb_pct < 40.0
-    )
-
-    if pattern_b:
-        return 'HOLD'   # veto: model is in Pattern B — historically only 37% accurate
-    return signal
+# Signal thresholds + technical veto live in the shared policy module so the
+# scheduled daily path (src/utils/forward_prediction.py) applies the SAME rules.
+from utils.signal_policy import (  # noqa: E402
+    SIGNAL_THRESHOLDS,
+    apply_signal_thresholds,
+    technical_veto,
+)
 logger = logging.getLogger(__name__)
 
 def safe_print(text):
@@ -138,12 +87,16 @@ class ForexTradingSignalPredictor:
         self.model_version = None
         self.model_scaler = None
         self.model_feature_columns = None
-        
+        self.feature_fill_values = {}
+
         # Load model artifacts
         self.load_model_artifacts()
-        
+
         # Database connection
         self.db = ForexSQLServerConnection()
+
+        # External data (market context + rates) — shared cache across pairs
+        self.external_data = ExternalDataSources()
         
         # Results exporter for writing back to SQL Server
         self.results_exporter = ForexResultsExporter(self.db)
@@ -222,7 +175,10 @@ class ForexTradingSignalPredictor:
         self.model_manager.best_model_name = artifacts.get('model_name')
         self.model_manager.scaler = artifacts.get('scaler')
         self.model_manager.label_encoder = artifacts.get('label_encoder')
-        
+
+        # Training-time NaN fill medians (fill-value parity with training)
+        self.feature_fill_values = artifacts.get('feature_fill_values') or {}
+
         # Use the model's specific feature columns if available
         self.model_feature_columns = artifacts.get('feature_columns')
         if self.model_feature_columns:
@@ -345,24 +301,41 @@ class ForexTradingSignalPredictor:
             
             # Merge calendar features (holidays, short weeks, bank holidays)
             df_features = self._merge_calendar_features(df_features)
-            
-            # Determine which features to use
+
+            # Determine which features the model expects
             if self.model_feature_columns:
                 # Use model's specific features (v3 enhanced)
                 expected_features = self.model_feature_columns
             else:
                 # Use model manager's default features
                 expected_features = self.model_manager.forex_feature_columns
-            
+
+            # Merge external features (market sentiment + rates) via the
+            # SHARED train/serve merge. Training adds these, so skipping them
+            # here would leave the model's sentiment/rates features silently
+            # defaulted at predict time (train/serve skew). Rates are merged
+            # whenever the LOADED ARTIFACT uses any rate_* feature — keyed to
+            # the model, not the config flag, so artifact and serve path stay
+            # self-consistent.
+            pair = self.currency_pair
+            if not pair and 'currency_pair' in df_features.columns:
+                pair = df_features['currency_pair'].iloc[0]
+            artifact_uses_rates = any(str(c).startswith('rate_') for c in expected_features)
+            df_features = add_external_features(df_features, pair, self.external_data,
+                                                include_rates=artifact_uses_rates)
+
             available_features = [col for col in expected_features if col in df_features.columns]
             missing_features = [col for col in expected_features if col not in df_features.columns]
-            
+
             if missing_features:
                 n_missing = len(missing_features)
-                safe_print(f"[WARN] Missing {n_missing} features - creating with defaults")
-                # Create missing features with zeros (safe default)
+                safe_print(f"[WARN] Missing {n_missing} model features - defaulting them: "
+                           f"{', '.join(missing_features[:15])}"
+                           f"{' ...' if n_missing > 15 else ''}")
+                # Create missing features with the training-time median when we
+                # have it, else 0 (last resort for pre-5.1 artifacts)
                 for feat in missing_features:
-                    df_features[feat] = 0
+                    df_features[feat] = self.feature_fill_values.get(feat, 0)
                 available_features = expected_features  # Now all are available
             
             safe_print(f"[DATA] Available features: {len(available_features)}/{len(expected_features)}")
@@ -532,8 +505,17 @@ class ForexTradingSignalPredictor:
                 safe_print("[ERROR] Insufficient features for prediction")
                 return pd.DataFrame()
             
-            # Get the MOST RECENT record only (latest trading day)
+            # Get the MOST RECENT record only (latest trading day).
+            # Median-fill structurally-NaN features (e.g. rate_* diffs for
+            # non-FRED currencies) BEFORE the dropna row filter, mirroring
+            # training — otherwise those pairs lose every row.
             df_features = df_features.sort_values('date_time')
+            if self.feature_fill_values:
+                fillable = [c for c in available_features
+                            if c in df_features.columns and c in self.feature_fill_values]
+                if fillable:
+                    df_features[fillable] = df_features[fillable].fillna(
+                        pd.Series(self.feature_fill_values))
             df_recent = df_features.dropna(subset=available_features).tail(1)
             
             if df_recent.empty:
@@ -542,9 +524,14 @@ class ForexTradingSignalPredictor:
             
             safe_print(f"[DATA] Predicting for latest date: {df_recent['date_time'].iloc[0]}")
             
-            # Prepare prediction input
+            # Prepare prediction input. NaN fill uses the training-time medians
+            # from the artifact (fill-value parity); 0 only as last resort for
+            # pre-5.1 artifacts that don't carry feature_fill_values.
             X_pred = df_recent[available_features].copy()
-            X_pred = X_pred.replace([np.inf, -np.inf], np.nan).fillna(0)
+            X_pred = X_pred.replace([np.inf, -np.inf], np.nan)
+            if self.feature_fill_values:
+                X_pred = X_pred.fillna(pd.Series(self.feature_fill_values))
+            X_pred = X_pred.fillna(0)
             
             # Make prediction for next trading day
             predictions = self.model_manager.predict(X_pred)

@@ -157,8 +157,49 @@ class ForexDailyAutomation:
             safe_print(f"[ERROR] Error checking data: {e}")
             return {}
     
+    def get_pair_freshness(self, max_business_days_stale: int = 1) -> dict:
+        """Per-pair data freshness from forex_hist_data (one round-trip).
+
+        Returns {pair: {'latest_date': date|None, 'business_days_stale': int,
+        'is_fresh': bool}}. A pair is fresh when its MAX(trading_date) is at
+        most `max_business_days_stale` business days old — so on a Monday,
+        Friday's close still counts as fresh.
+
+        This is the gate that prevents the Jun 22-24 failure mode (stale close
+        prices silently producing confident, wrong signals) and the USDINR
+        case (predictions generated on 50-day-old data).
+        """
+        freshness = {}
+        try:
+            from sqlalchemy import text
+            query = text("""
+            SELECT symbol, MAX(trading_date) AS latest_date
+            FROM forex_hist_data
+            GROUP BY symbol
+            """)
+            df = pd.read_sql_query(query, self.db.get_sqlalchemy_engine())
+
+            today = np.datetime64(datetime.now().date())
+            for _, row in df.iterrows():
+                latest = pd.to_datetime(row['latest_date']).date()
+                # busday_count counts business days in [latest, today)
+                stale_days = int(np.busday_count(np.datetime64(latest), today))
+                freshness[row['symbol']] = {
+                    'latest_date': latest,
+                    'business_days_stale': stale_days,
+                    'is_fresh': stale_days <= max_business_days_stale,
+                }
+        except Exception as e:
+            safe_print(f"[WARN] Could not compute per-pair freshness: {e}")
+        return freshness
+
     def check_data_freshness(self):
-        """Check if the latest data is available before running predictions."""
+        """Informational global freshness preflight (does NOT gate anything).
+
+        Uses a single MAX(trading_date) across all pairs, so one current pair
+        makes it pass. The enforced per-pair gate is get_pair_freshness(),
+        applied inside run_daily_predictions().
+        """
         try:
             safe_print("[CHECK] Checking data freshness...")
             
@@ -329,14 +370,30 @@ class ForexDailyAutomation:
             
             safe_print(f"[DATA] Processing {len(pairs_to_analyze)} currency pairs")
             safe_print(f"[FOREX] Pairs: {', '.join(pairs_to_analyze)}")
-            
+
+            # Per-pair freshness gate: never predict on stale prices (the model
+            # would be confidently wrong about inputs, not the market).
+            freshness = self.get_pair_freshness()
+
             all_predictions = []
             all_features = []
-            
+            skipped_pairs = []
+
             for pair in pairs_to_analyze:
                 try:
+                    info = freshness.get(pair)
+                    if info is not None and not info['is_fresh']:
+                        safe_print(f"[ERROR] {pair}: data stale (latest {info['latest_date']}, "
+                                   f"{info['business_days_stale']} business days old) - SKIPPING")
+                        skipped_pairs.append((pair, info))
+                        continue
+                    if info is None and freshness:
+                        safe_print(f"[ERROR] {pair}: no rows in forex_hist_data - SKIPPING")
+                        skipped_pairs.append((pair, None))
+                        continue
+
                     safe_print(f"[DATA] Processing {pair}...")
-                    
+
                     # Initialize predictor for this pair
                     predictor = ForexTradingSignalPredictor(
                         model_path='./data/best_forex_model.joblib',
@@ -427,11 +484,13 @@ class ForexDailyAutomation:
                     safe_print("[OK] Predictions exported to database")
                 
                 # Log summary
-                self._log_prediction_summary(combined_predictions)
-                
+                self._log_prediction_summary(combined_predictions, skipped_pairs)
+
                 return True
             else:
                 safe_print("[ERROR] No predictions generated for any pairs")
+                if skipped_pairs:
+                    self._log_prediction_summary(pd.DataFrame(), skipped_pairs)
                 return False
                 
         except Exception as e:
@@ -440,155 +499,110 @@ class ForexDailyAutomation:
             traceback.print_exc()
             return False
     
-    def _log_prediction_summary(self, predictions_df):
-        """Log a summary of today's predictions."""
+    def _log_prediction_summary(self, predictions_df, skipped_pairs=None):
+        """Log a summary of today's predictions, gate decisions, and skips."""
         safe_print("\n[SUMMARY] Prediction Summary:")
         safe_print("  " + "-" * 50)
-        
+
         if 'predicted_signal' in predictions_df.columns:
             signal_counts = predictions_df['predicted_signal'].value_counts()
             for signal, count in signal_counts.items():
                 safe_print(f"  {signal}: {count} pairs")
-        
+
         if 'signal_confidence' in predictions_df.columns:
             avg_conf = predictions_df['signal_confidence'].mean()
             high_conf = (predictions_df['signal_confidence'] > 0.65).sum()
             safe_print(f"  Average confidence: {avg_conf:.3f}")
             safe_print(f"  High-confidence signals (>65%): {high_conf}")
+
+        # Signal-policy gate decisions (HOLD = abstain under the binary model)
+        if 'gate_reason' in predictions_df.columns:
+            gated = predictions_df[predictions_df['gate_reason'].isin(['abstain', 'veto'])]
+            if not gated.empty:
+                safe_print(f"  Gated to HOLD: {len(gated)} pairs")
+                for _, row in gated.iterrows():
+                    safe_print(f"    {row['currency_pair']}: {row['gate_reason']} "
+                               f"(buy={row.get('prob_buy', 0):.3f}, sell={row.get('prob_sell', 0):.3f})")
+
+        if skipped_pairs:
+            safe_print(f"\n  Skipped (stale data): {len(skipped_pairs)} pairs")
+            for pair, info in skipped_pairs:
+                if info:
+                    safe_print(f"    {pair}: latest {info['latest_date']} "
+                               f"({info['business_days_stale']} business days old)")
+                else:
+                    safe_print(f"    {pair}: no data in forex_hist_data")
     
     def retrain_models_weekly(self):
         """
-        Retrain models weekly with fresh data from ALL currency pairs.
-        
-        Enhanced with:
-        - Walk-forward validation before deployment
-        - Binary direction prediction for better accuracy
-        - Feature selection to reduce noise
-        - Model stability checks
+        Retrain the production model with fresh data from ALL currency pairs.
+
+        Delegates to EnhancedForexTrainer.train_production_model() — the single
+        canonical training path (binary direction, 400-day lookback, live pair
+        list; see forex_config). Do NOT call the lower-level training APIs here
+        with ad-hoc arguments: a previous version of this method quietly used
+        use_binary_direction=False + lookback_days=90 and reverted production
+        to the edge-less 3-class model every Sunday (2026-06-28 regression).
+
+        On any failure the existing model artifact is kept — a stale-but-good
+        model beats a fresh-but-broken one. Returns True on success.
         """
         safe_print("[PROCESSING] Starting model retraining with ALL currency pairs...")
-        
+
         try:
-            # Try to use the enhanced trainer first
             sys.path.append('.')
-            
+            from train_enhanced_model import EnhancedForexTrainer
+
+            safe_print("[INFO] Using enhanced training pipeline (production config)...")
+            trainer = EnhancedForexTrainer()
+
+            # Test database connection
+            if not trainer.db.test_connection():
+                safe_print("[ERROR] Database connection failed - keeping existing model artifact")
+                return False
+
+            results = trainer.train_production_model()
+
+            if not results:
+                safe_print("[ERROR] Retraining produced no results - keeping existing model artifact")
+                return False
+
+            safe_print(f"[OK] Enhanced model retrained: {results['best_model_name']}")
+
+            # Export performance
             try:
-                from train_enhanced_model import EnhancedForexTrainer
-                
-                safe_print("[INFO] Using enhanced training pipeline...")
-                trainer = EnhancedForexTrainer()
-                
-                # Test database connection
-                if not trainer.db.test_connection():
-                    safe_print("[ERROR] Database connection failed")
-                    return
-                
-                # Get ALL available currency pairs
-                pairs = self.db.get_forex_pairs()
-                safe_print(f"[DATA] Found {len(pairs)} currency pairs for retraining")
-                
-                # Prepare enhanced dataset — 90-day rolling window avoids stale regime bias
-                enhanced_data = trainer.prepare_enhanced_dataset(pairs, lookback_days=90)
-                
-                # Train with 3-class prediction (BUY/SELL/HOLD) using trend signal type
-                results = trainer.train_enhanced_models(
-                    test_size=0.2, 
-                    use_binary_direction=False
-                )
-                
-                if results:
-                    safe_print(f"[OK] Enhanced model retrained: {results['best_model_name']}")
-                    
-                    # Export performance
-                    try:
-                        model_results = results.get('results', {})
-                        perf_data = {}
-                        for name, res in model_results.items():
-                            if isinstance(res, dict) and 'cv_accuracy_mean' in res:
-                                perf_data[name] = {
-                                    'cv_accuracy_mean': res['cv_accuracy_mean'],
-                                    'cv_accuracy_std': res.get('cv_accuracy_std', 0),
-                                    'train_accuracy': res.get('train_accuracy', 0),
-                                    'train_precision': 0,
-                                    'train_recall': 0,
-                                    'train_f1': 0
-                                }
-                        
-                        if perf_data:
-                            self.results_exporter.export_model_performance(
-                                model_results=perf_data,
-                                model_name='enhanced_direction_model',
-                                training_pairs=pairs,
-                                training_date=datetime.now()
-                            )
-                            safe_print("[OK] Model performance exported to database")
-                    except Exception as e:
-                        safe_print(f"[WARN] Could not export model performance: {e}")
-                    
-                    return
-                else:
-                    safe_print("[WARN] Enhanced training produced no results, falling back...")
-                    
-            except ImportError as e:
-                safe_print(f"[WARN] Enhanced trainer not available ({e}), using standard training...")
-            except Exception as e:
-                safe_print(f"[WARN] Enhanced training failed ({e}), falling back to standard...")
-            
-            # Fallback: Standard training
-            from predict_forex_signals import ForexTradingSignalPredictor
-            
-            pairs = self.db.get_forex_pairs()
-            safe_print(f"[DATA] Retraining with {len(pairs)} currency pairs (standard pipeline)")
-            
-            all_forex_data = []
-            
-            for pair in pairs:
-                try:
-                    predictor = ForexTradingSignalPredictor(
-                        model_path='./data/best_forex_model.joblib',
-                        currency_pair=pair
+                model_results = results.get('results', {})
+                perf_data = {}
+                for name, res in model_results.items():
+                    if isinstance(res, dict) and 'cv_accuracy_mean' in res:
+                        perf_data[name] = {
+                            'cv_accuracy_mean': res['cv_accuracy_mean'],
+                            'cv_accuracy_std': res.get('cv_accuracy_std', 0),
+                            'train_accuracy': res.get('train_accuracy', 0),
+                            'train_precision': 0,
+                            'train_recall': 0,
+                            'train_f1': 0
+                        }
+
+                if perf_data:
+                    self.results_exporter.export_model_performance(
+                        model_results=perf_data,
+                        model_name='enhanced_direction_model',
+                        training_pairs=self.db.get_forex_pairs(),
+                        training_date=datetime.now()
                     )
-                    
-                    forex_data = predictor.get_forex_data(currency_pair=pair, days_back=300)
-                    
-                    if not forex_data.empty:
-                        forex_data['currency_pair'] = pair
-                        all_forex_data.append(forex_data)
-                        safe_print(f"[OK] {pair}: {len(forex_data)} records")
-                        
-                except Exception as e:
-                    safe_print(f"[ERROR] Error collecting data for {pair}: {e}")
-                    continue
-            
-            if all_forex_data:
-                combined_data = pd.concat(all_forex_data, ignore_index=True)
-                safe_print(f"[DATA] Combined: {len(combined_data)} records from {len(all_forex_data)} pairs")
-                
-                # Train with direction signal type for better accuracy
-                main_predictor = ForexTradingSignalPredictor(
-                    model_path='./data/best_forex_model.joblib',
-                    currency_pair=pairs[0]
-                )
-                
-                success = main_predictor.train_model(
-                    combined_data, 
-                    signal_type='trend',  # Adaptive volatility-based thresholds to fix SELL bias
-                    future_periods=1           # 1-day ahead
-                )
-                
-                if success:
-                    safe_print("[OK] Model retrained successfully")
-                else:
-                    safe_print("[ERROR] Failed to retrain model")
-            else:
-                safe_print("[ERROR] No data collected from any currency pairs")
-            
+                    safe_print("[OK] Model performance exported to database")
+            except Exception as e:
+                safe_print(f"[WARN] Could not export model performance: {e}")
+
             safe_print("[OK] Weekly model retraining completed")
-            
+            return True
+
         except Exception as e:
-            safe_print(f"[ERROR] Error in weekly retraining: {e}")
+            safe_print(f"[ERROR] Error in weekly retraining: {e} - keeping existing model artifact")
             import traceback
             traceback.print_exc()
+            return False
     
     def cleanup_old_reports(self, days_to_keep=30):
         """Clean up old report files."""
