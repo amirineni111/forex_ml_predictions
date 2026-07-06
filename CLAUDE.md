@@ -143,9 +143,10 @@ sqlserver_copilot_forex/
   + market-context + `rate_*` differentials, with ~30 selected for the model
   after variance/missingness filtering + multi-method selection. Cross-pair
   "relative" features were removed in the rollback.
-- **Measured performance (honest, leakage-free, 2026-07-04 retrain):**
-  walk-forward 0.626 / test 0.612 / CV 0.600 (vs 0.50 coin-flip), best model
-  `voting_soft`, stability PASSED, overfit gap ~0.14 (down from ~0.20).
+- **Measured performance (honest, leakage-free, 2026-07-06 retrain — first with
+  the 5 new pairs):** walk-forward 0.655 / test 0.644 / CV 0.626 (vs 0.50
+  coin-flip), best model `xgboost`, stability PASSED, overfit gap ~0.14.
+  (Previous 2026-07-04 retrain: WF 0.626 / test 0.612, `voting_soft`.)
 - **Training Data**: `forex_hist_data` for all active pairs, 400-day window.
 
 ### Feature Categories (100+)
@@ -176,13 +177,16 @@ sqlserver_copilot_forex/
 | model_version | VARCHAR | `5.2_binary_rates` (current; daily rows carry a `+gated` suffix when the artifact predates the gate) |
 
 ### Currency Pairs (actual, from `forex_hist_data`)
-> ⚠️ The pairs actually present in the DB differ from earlier docs. There is **no**
-> USD/CHF, USD/CAD, EUR/GBP, or GBP/JPY; instead EUR/CHF and the Asian pairs
-> USD/HKD, USD/SGD, USD/INR are present. `train_enhanced_model.py` fetches the live
-> list via `get_forex_pairs()`.
+> Pair discovery is live (`get_forex_pairs()` = `SELECT DISTINCT symbol FROM
+> forex_hist_data`) on both the training and daily-prediction paths, so pairs
+> added to the DB are picked up automatically. On **2026-07-06** five pairs were
+> added with ~1 year of history (AUD/NZD, EUR/GBP, GBP/JPY, USD/CAD, USD/CHF)
+> and the model was retrained the same day (WF 0.655, best model `xgboost`,
+> stability PASSED).
 
-**10 active pairs:** EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/JPY, EUR/JPY,
-EUR/CHF, USD/HKD, USD/SGD, USD/INR. All train into the single global model.
+**15 active pairs:** EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/JPY, EUR/JPY,
+EUR/CHF, USD/HKD, USD/SGD, USD/INR, AUD/NZD, EUR/GBP, GBP/JPY, USD/CAD,
+USD/CHF. All train into the single global model.
 
 > The cluster grouping below is **no longer used for modeling** (per-cluster
 > models were rolled back). It remains in `src/forex_config.py` only as reference /
@@ -191,9 +195,9 @@ EUR/CHF, USD/HKD, USD/SGD, USD/INR. All train into the single global model.
 > | Cluster | Pairs |
 > |---------|-------|
 > | `usd_majors` | EUR/USD, GBP/USD |
-> | `commodity` | AUD/USD, NZD/USD |
-> | `jpy_crosses` | USD/JPY, EUR/JPY |
-> | `eur_crosses` | EUR/CHF |
+> | `commodity` | AUD/USD, NZD/USD, USD/CAD, AUD/NZD |
+> | `jpy_crosses` | USD/JPY, EUR/JPY, GBP/JPY |
+> | `eur_crosses` | EUR/CHF, EUR/GBP, USD/CHF |
 > | `usd_asia` | USD/HKD, USD/SGD, USD/INR |
 
 ---

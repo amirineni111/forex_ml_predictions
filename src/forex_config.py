@@ -25,6 +25,7 @@ from typing import Dict, List
 DEFAULT_PAIRS: List[str] = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'NZDUSD',
     'EURJPY', 'EURCHF', 'USDHKD', 'USDSGD', 'USDINR',
+    'AUDNZD', 'EURGBP', 'GBPJPY', 'USDCAD', 'USDCHF',
 ]
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ PAIR_TO_CLUSTER: Dict[str, str] = {
     'AUDUSD': 'commodity',
     'NZDUSD': 'commodity',
     'USDCAD': 'commodity',
+    'AUDNZD': 'commodity',
     # JPY crosses
     'USDJPY': 'jpy_crosses',
     'EURJPY': 'jpy_crosses',
