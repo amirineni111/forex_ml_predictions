@@ -583,6 +583,12 @@ class ForexDailyAutomation:
             # Export performance
             try:
                 model_results = results.get('results', {})
+                # These are model-invariant (same dataset/feature set for every
+                # candidate), so pull them from the top-level results once and
+                # stamp them onto each per-model record — the feedback (P0-5)
+                # specifically wants training_samples/features_count populated.
+                features_count = len(results.get('feature_columns', []))
+                training_samples = results.get('training_samples', 0)
                 perf_data = {}
                 for name, res in model_results.items():
                     if isinstance(res, dict) and 'cv_accuracy_mean' in res:
@@ -592,7 +598,9 @@ class ForexDailyAutomation:
                             'train_accuracy': res.get('train_accuracy', 0),
                             'train_precision': 0,
                             'train_recall': 0,
-                            'train_f1': 0
+                            'train_f1': 0,
+                            'training_samples': training_samples,
+                            'features_count': features_count
                         }
 
                 if perf_data:

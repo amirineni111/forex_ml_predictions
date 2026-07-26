@@ -434,6 +434,7 @@ class EnhancedForexTrainer:
             'test_results': test_results,
             'wf_results': wf_results,
             'feature_columns': X_selected.columns.tolist(),
+            'training_samples': len(X),
             'label_encoder': label_encoder,
             'scaler': self.model_trainer.scaler,
             'stability_passed': stability_ok,
