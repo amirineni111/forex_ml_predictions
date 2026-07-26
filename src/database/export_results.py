@@ -206,16 +206,17 @@ class ForexResultsExporter:
         Returns:
             bool: True if successful, False otherwise
         """
+        # NOTE: forex_model_performance is intentionally NOT dropped. It is an
+        # accumulating training-history log (written only by the weekly retrain);
+        # dropping it discards every prior training record. Only today's
+        # predictions and the daily summary snapshot are cleaned.
         drop_tables_sql = f"""
         -- Clean today's predictions only (preserve history + backfill columns)
         IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.predictions_table}' AND xtype='U')
             DELETE FROM {self.predictions_table} WHERE CAST(prediction_date AS date) = CAST(GETDATE() AS date)
-        
+
         IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.daily_summary_table}' AND xtype='U')
             DROP TABLE {self.daily_summary_table}
-        
-        IF EXISTS (SELECT * FROM sysobjects WHERE name='{self.model_performance_table}' AND xtype='U')
-            DROP TABLE {self.model_performance_table}
         """
         
         try:
@@ -406,13 +407,20 @@ class ForexResultsExporter:
         try:
             performance_records = []
             training_date = training_date or datetime.now()
-            currency_pairs_str = ','.join(training_pairs) if training_pairs else 'ALL'
-            
+            full_pairs = ','.join(training_pairs) if training_pairs else 'ALL'
+            # currency_pair is VARCHAR(10). The production model is a single global
+            # model spanning all pairs, so joining every symbol here (~100 chars)
+            # overflowed the column and every INSERT failed with a truncation error
+            # (that, plus the daily table-drop, is why forex_model_performance was
+            # perpetually empty). Store a short marker that fits, and keep the full
+            # pair list in model_params (TEXT).
+            currency_pair_value = full_pairs if len(full_pairs) <= 10 else 'ALL'
+
             for model_type, metrics in model_results.items():
                 if isinstance(metrics, dict) and 'cv_accuracy_mean' in metrics:
                     record = {
                         'model_name': f"{model_name}_{model_type}",
-                        'currency_pair': currency_pairs_str,
+                        'currency_pair': currency_pair_value,
                         'training_date': training_date,
                         'cv_accuracy_mean': metrics.get('cv_accuracy_mean', 0.0),
                         'cv_accuracy_std': metrics.get('cv_accuracy_std', 0.0),
@@ -424,7 +432,7 @@ class ForexResultsExporter:
                         'training_samples': metrics.get('training_samples', 0),
                         'features_count': metrics.get('features_count', 0),
                         'signal_type': 'multi_currency',
-                        'model_params': str(metrics)
+                        'model_params': f"pairs=[{full_pairs}] metrics={metrics}"
                     }
                     performance_records.append(record)
             

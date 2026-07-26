@@ -98,10 +98,16 @@ class ForexDailyAutomation:
                 # Table might not exist yet on first run -- that's OK, create_results_tables will handle it
                 safe_print(f"[WARN] forex_ml_predictions cleanup: {e}")
             
-            # For summary and performance tables: safe to drop and recreate (no backfill dependency)
+            # For the daily summary table: safe to drop and recreate (it is a
+            # per-day snapshot with no cross-run history to preserve).
+            #
+            # forex_model_performance is deliberately NOT dropped here. It is an
+            # accumulating training-history log written only by the weekly
+            # retrain (retrain_models_weekly -> export_model_performance). Dropping
+            # it on every daily run wiped every row the Sunday retrain wrote, which
+            # is why the table was perpetually empty (0 rows ever). Leave it intact.
             tables_to_drop = [
-                'forex_daily_summary', 
-                'forex_model_performance'
+                'forex_daily_summary',
             ]
             
             for table in tables_to_drop:
@@ -473,7 +479,12 @@ class ForexDailyAutomation:
                     if feature_success:
                         safe_print("[OK] Feature values exported to database")
                     else:
-                        safe_print("[WARN] Could not export feature values")
+                        # Escalated from WARN to ERROR: a silent feature-export
+                        # failure leaves forex_prediction_features stale while
+                        # daily signals keep flowing, which can hide a freeze for
+                        # days. Surface it loudly so freshness monitoring catches it.
+                        safe_print("[ERROR] Could not export feature values to "
+                                   "forex_prediction_features (technicals will be stale)")
                 
                 if db_success:
                     self.results_exporter.export_daily_summary(
@@ -585,13 +596,17 @@ class ForexDailyAutomation:
                         }
 
                 if perf_data:
-                    self.results_exporter.export_model_performance(
+                    perf_ok = self.results_exporter.export_model_performance(
                         model_results=perf_data,
                         model_name='enhanced_direction_model',
                         training_pairs=self.db.get_forex_pairs(),
                         training_date=datetime.now()
                     )
-                    safe_print("[OK] Model performance exported to database")
+                    if perf_ok:
+                        safe_print("[OK] Model performance exported to database")
+                    else:
+                        safe_print("[ERROR] Model performance export FAILED "
+                                   "(forex_model_performance not updated)")
             except Exception as e:
                 safe_print(f"[WARN] Could not export model performance: {e}")
 

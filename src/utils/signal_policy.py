@@ -9,17 +9,36 @@ production daily path (forward_prediction) shipped raw argmax signals and the
 logic in this module so the two paths cannot diverge again.
 """
 
+import os
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Asymmetric signal thresholds
-# SELL was over-predicted (only 32-44% accurate at high confidence).
-# Raise its bar so the model only fires SELL when it is very sure.
+# Asymmetric signal thresholds (configurable via environment).
+#
+# SELL was over-predicted, so its bar was originally raised to 0.75. But after
+# the 2026-07-06 retrain the current model's probability distribution compressed:
+# prob_sell now tops out near ~0.70 (trailing-30-day max), so a 0.75 gate was
+# mathematically unreachable and SELL never fired at all. Lowered the default to
+# 0.62 (2026-07-26) — still asymmetrically stricter than BUY (0.55) so SELL only
+# fires with clear conviction, but now actually reachable.
+#
+# Override without a code change via env vars, e.g. FOREX_SELL_THRESHOLD=0.60.
 # ---------------------------------------------------------------------------
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == '':
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 SIGNAL_THRESHOLDS = {
-    'BUY':  0.55,   # BUY accuracy is solid — minor raise
-    'SELL': 0.75,   # SELL is chronically over-predicted — raise significantly
-    'HOLD': 0.50,   # neutral baseline
+    'BUY':  _env_float('FOREX_BUY_THRESHOLD', 0.55),   # BUY accuracy is solid
+    'SELL': _env_float('FOREX_SELL_THRESHOLD', 0.62),  # reachable + still strict
+    'HOLD': 0.50,                                       # neutral baseline
 }
 
 
