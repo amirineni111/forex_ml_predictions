@@ -468,14 +468,20 @@ class ForexResultsExporter:
             logger.error(f"❌ Error exporting model performance: {e}")
             return False
     
-    def export_prediction_features(self, features_df: pd.DataFrame, predictions_df: pd.DataFrame) -> bool:
+    def export_prediction_features(self, features_df: pd.DataFrame, predictions_df: pd.DataFrame,
+                                   prediction_date=None) -> bool:
         """
         Export prediction feature values to the features table for analysis.
-        
+
         Args:
             features_df: DataFrame with all feature values used for predictions
             predictions_df: DataFrame with prediction results
-            
+            prediction_date: Target date to stamp on the rows. Defaults to the
+                next business day (the live daily-run behaviour). Passed
+                explicitly by backfill_prediction_features.py so historical
+                rows are written through this same path rather than a
+                parallel INSERT that can drift from it.
+
         Returns:
             True if successful, False otherwise
         """
@@ -491,14 +497,15 @@ class ForexResultsExporter:
                 how='left'
             )
             
-            # Add prediction_date from tomorrow
+            # Stamp the target date: caller-supplied (backfill) or the next
+            # business day (live daily run).
             from datetime import datetime, timedelta
-            today = datetime.now().date()
-            tomorrow = today + timedelta(days=1)
-            # Skip weekends
-            while tomorrow.weekday() >= 5:
-                tomorrow = tomorrow + timedelta(days=1)
-            combined_df['prediction_date'] = tomorrow
+            if prediction_date is None:
+                prediction_date = datetime.now().date() + timedelta(days=1)
+                # Skip weekends
+                while prediction_date.weekday() >= 5:
+                    prediction_date = prediction_date + timedelta(days=1)
+            combined_df['prediction_date'] = prediction_date
             
             # Normalise column name variants produced by different model/feature versions:
             #   rsi_14  -> rsi   (used by ml_models.py forex_feature_columns)
@@ -534,8 +541,31 @@ class ForexResultsExporter:
             export_df = export_df.fillna(0)
             
             logger.info(f"Inserting {len(export_df)} feature records with {len(available_columns)} columns: {available_columns}")
-            
+
             engine = self.db.get_sqlalchemy_engine()
+
+            # Idempotent write: clear any existing rows for the exact
+            # (prediction_date, currency_pair) keys we are about to insert.
+            # This table is append-only otherwise, and its prediction_date is
+            # TOMORROW's date — so create_results_tables()'s DELETE-on-GETDATE()
+            # never matches it. Any re-run of the daily job (manual --run-now,
+            # a retry, a smoke test) silently doubled the rows: see 2026-06-26
+            # (50 rows), 2026-07-06 and 2026-07-07 (24 rows each).
+            key_pairs = (export_df[['prediction_date', 'currency_pair']]
+                         .drop_duplicates().itertuples(index=False, name=None))
+            deleted = 0
+            with engine.begin() as conn:
+                for pred_date, pair in key_pairs:
+                    result = conn.execute(
+                        text("DELETE FROM dbo.forex_prediction_features "
+                             "WHERE CAST(prediction_date AS DATE) = :pd "
+                             "AND currency_pair = :cp"),
+                        {"pd": pred_date, "cp": pair}
+                    )
+                    deleted += result.rowcount or 0
+            if deleted:
+                logger.info(f"Replaced {deleted} existing feature row(s) for these keys")
+
             rows_inserted = export_df.to_sql(
                 'forex_prediction_features',
                 engine,

@@ -409,8 +409,33 @@ class ForexDailyAutomation:
                     # Get feature data for export
                     df = predictor.get_forex_data(currency_pair=pair, days_back=100)
                     df_features, available_features = predictor.prepare_features(df)
+
+                    # Mirror src/utils/forward_prediction.py exactly: median-fill
+                    # structurally-NaN features BEFORE the dropna row filter, so the
+                    # exported row is the same row the prediction was made from.
+                    # Without this, pairs whose rate_* diffs are all-NaN (no FRED
+                    # coverage: HKD/SGD/INR) lose every row here and silently vanish
+                    # from forex_prediction_features while still being predicted —
+                    # which is what happened from the 2026-07-06 retrain onward, once
+                    # rate_yield_10y_diff_chg_* entered the selected feature set.
+                    # prepare_features only defaults features missing as COLUMNS;
+                    # all-NaN columns that exist pass through unfilled.
+                    df_features = df_features.sort_values('date_time')
+                    fill_values = getattr(predictor, 'feature_fill_values', None) or {}
+                    if fill_values:
+                        fillable = [c for c in available_features
+                                    if c in df_features.columns and c in fill_values]
+                        if fillable:
+                            df_features[fillable] = df_features[fillable].fillna(
+                                pd.Series(fill_values))
                     df_recent = df_features.dropna(subset=available_features).tail(1)
-                    
+
+                    if df_recent.empty:
+                        # Not fatal (the prediction below may still succeed), but it
+                        # means this pair contributes no technicals row today.
+                        safe_print(f"[WARN] {pair}: no complete feature row - "
+                                   f"skipping forex_prediction_features export")
+
                     if not df_recent.empty:
                         # Collect raw TA columns (OHLCV + SMA/EMA/RSI/MACD/BB/ATR) for
                         # forex_prediction_features table — NOT the ML model feature subset,
