@@ -101,7 +101,7 @@ sqlserver_copilot_forex/
 > | File | Purpose |
 > |------|---------|
 > | `train_enhanced_model.py` | Training. **Production entry:** `EnhancedForexTrainer.train_production_model()` (live pair list, binary target, 400-day window — constants in `src/forex_config.py`). Never call the lower-level `prepare_enhanced_dataset`/`train_enhanced_models` with ad-hoc args for production. |
-> | `src/utils/signal_policy.py` | **Single source of truth** for signal thresholds (SELL ≥ 0.75, BUY ≥ 0.55) + Pattern-B technical veto + `gate_binary_signal()`. Both prediction paths import from here. |
+> | `src/utils/signal_policy.py` | **Single source of truth** for signal thresholds (SELL ≥ 0.62, BUY ≥ 0.55; env-overridable via `FOREX_SELL_THRESHOLD`/`FOREX_BUY_THRESHOLD`) + Pattern-B technical veto + `gate_binary_signal()`. Both prediction paths import from here. |
 > | `src/utils/forward_prediction.py` | The scheduled daily path — now applies `signal_policy` gating (was raw argmax) |
 > | `src/features/external_merge.py` | **The only place external features are merged** (market context + rate differentials), called by BOTH training and prediction — see §5 |
 > | `src/features/advanced_features.py` | ~150 per-pair technical features. **Sorts ascending by `date_time` first** (critical — see §5). |
@@ -110,6 +110,7 @@ sqlserver_copilot_forex/
 > | `scripts/seed_forex_rates.py` | FRED ingestion → `forex_rates_daily` |
 > | `scripts/compare_rates_features.py` | A/B gate: trains with/without rates features, saves the walk-forward winner |
 > | `scripts/check_train_serve_parity.py` | Regression guard: asserts train and predict pipelines produce identical model features |
+> | `scripts/audit_live_performance.py` | Live accuracy audit from `forex_ml_predictions`: BUY edge vs always-long base rate, confidence-bucket inversion, signal mix. Enforces the §5 scoring rules |
 > | `data/best_forex_model.joblib` | The single production model artifact (git-ignored — retrain to regenerate) |
 >
 > Removed in the 2026-06-25 rollback: `src/features/relative_features.py` and the
@@ -130,11 +131,18 @@ sqlserver_copilot_forex/
   volatility thresholds) still exists in the code but is **not used in
   production** — it had no measurable edge once leakage was removed.
 - **Signal gate (predict time)**: `src/utils/signal_policy.py` applies asymmetric
-  thresholds — SELL fires only at `prob_sell ≥ 0.75`, BUY at `prob_buy ≥ 0.55`;
+  thresholds — SELL fires only at `prob_sell ≥ 0.62`, BUY at `prob_buy ≥ 0.55`;
   otherwise the output is **'HOLD' = ABSTAIN** (low conviction), and a clearing
   SELL can still be demoted to HOLD by the Pattern-B technical veto. HOLD is not
   a model class: `prob_hold` stays 0.0. The `gate_reason` (threshold/abstain/veto)
-  is logged in the run summary.
+  is logged in the run summary. Both thresholds are env-overridable
+  (`FOREX_SELL_THRESHOLD`, `FOREX_BUY_THRESHOLD`).
+  > The SELL bar was **0.75 until 2026-07-26**. After the retrain compressed the
+  > probability distribution (`prob_sell` tops out near 0.70) a 0.75 gate was
+  > mathematically unreachable and SELL stopped firing entirely; it was lowered
+  > to 0.62. SELL is still nearly dormant — **9 SELL rows out of 611** in
+  > Jul 6–Sep 4. Any change here must be re-checked against the live
+  > `prob_sell` range, not assumed.
 - **Freshness gate**: the daily run skips (with `[ERROR]` + summary entry) any
   pair whose `MAX(trading_date)` in `forex_hist_data` is >1 business day old —
   stale prices produced the silent bad-signal episodes of Jun 22–24 and the
@@ -143,11 +151,67 @@ sqlserver_copilot_forex/
   + market-context + `rate_*` differentials, with ~30 selected for the model
   after variance/missingness filtering + multi-method selection. Cross-pair
   "relative" features were removed in the rollback.
-- **Measured performance (honest, leakage-free, 2026-07-06 retrain — first with
-  the 5 new pairs):** walk-forward 0.655 / test 0.644 / CV 0.626 (vs 0.50
-  coin-flip), best model `xgboost`, stability PASSED, overfit gap ~0.14.
-  (Previous 2026-07-04 retrain: WF 0.626 / test 0.612, `voting_soft`.)
+- **Backtest performance (current artifact, 2026-08-30 retrain):** best model
+  `voting_soft`, walk-forward 0.6272 (std 0.0179, 5 windows) / CV 0.6093 /
+  overfit gap 0.089. Runner-up candidates were within noise (logistic_l2 WF
+  0.6285, xgboost WF 0.6282). Read these from the artifact
+  (`walk_forward_results` / `training_results` in `data/best_forex_model.joblib`),
+  not from this file — it goes stale every Sunday retrain.
+  (History: 2026-07-06 retrain WF 0.655 `xgboost`; 2026-07-04 WF 0.626.)
+- **⚠️ LIVE performance does NOT match backtest — see §3.1 below.** Walk-forward
+  0.63 has not reproduced out-of-sample: live BUY accuracy is 0.534 against a
+  0.548 always-long base rate, i.e. **no measurable 1-day edge**.
 - **Training Data**: `forex_hist_data` for all active pairs, 400-day window.
+
+### 3.1 Live measured performance (audit 2026-09-04) — READ BEFORE TUNING
+
+Scored from `forex_ml_predictions` where `model_version='5.2_binary_rates+gated'`
+(571 scored rows, 2026-07-06 → 2026-09-04). These are the numbers that matter;
+the walk-forward figures above have **not** reproduced live.
+
+**(a) There is no 1-day edge. There may be a 5-day edge.**
+
+| Horizon | BUY accuracy | always-long base rate | edge |
+|---------|--------------|-----------------------|------|
+| 1-day | 0.534 | 0.548 | **−1.5 pts** |
+| 5-day | 0.638 | 0.531 | **+9.4 pts** |
+
+The base rate is the trap: over this window 54.8% of pair-days closed up, so a
+raw 0.534 BUY accuracy is *worse than always buying*. **Never evaluate this model
+against 0.50** — always compare to the realised up-rate on the same rows.
+Only AUD/NZD (+17.9 pts) and NZD/USD (+17.5 pts) beat their base rate
+meaningfully at 1 day; 8 of 14 pairs are negative. Caveat: 5-day windows on daily
+predictions overlap heavily, so the +9.4 is autocorrelated and its effective
+sample is far below n=234 — directionally real, magnitude soft.
+
+**(b) Confidence is ANTI-correlated with accuracy.**
+
+| `signal_confidence` | n | 1-day accuracy |
+|---------------------|---|----------------|
+| 0.55–0.60 | 129 | **0.574** |
+| 0.60–0.65 | 68 | 0.500 |
+| 0.65–0.70 | 31 | 0.484 |
+| 0.70+ | 15 | **0.400** |
+
+Monotone decline across the whole live range. Any downstream tier/sizing logic
+that favours *higher* confidence is selecting the worse half of the book.
+Do not "fix" this by lowering a confidence gate to make it reachable.
+
+**(c) No v5.2 signal has ever reached 0.80 confidence** (max BUY = 0.783, max
+SELL = 0.719). The ≥ 0.80 signals in the table are all from the **pre-leakage-fix**
+v3.0/v4.0 era (max 0.993) and are not comparable. v5.2's compressed confidence is
+the honest one — the 0.99s were the bug. A downstream tier gate requiring ≥ 0.80
+is unreachable by construction.
+
+**(d) ⚠️ HOLD rows are effectively auto-correct.** The upstream scoring job
+(`backfill_strategy1_outcomes.py`, in the `STREAMLIT_TRADING_DASHBOARD` repo)
+marks a HOLD "Correct" when the move is `< 1%` — a band calibrated for equities.
+**97% of FX pair-days move less than 1%** (mean absolute move: 0.243%), so HOLD
+scores 0.976 across 422 rows and the flag carries almost no information.
+**Any pooled accuracy over this table is inflated** and mostly measures how often
+the model abstained. Always filter `predicted_signal <> 'HOLD'` when scoring.
+The proper upstream fix is an FX-scaled band (≈ 0.25%, or ATR-relative per pair),
+not the equity 1%.
 
 ### Feature Categories (100+)
 | Category | Examples |
@@ -167,7 +231,7 @@ sqlserver_copilot_forex/
 | Column | Type | Description |
 |--------|------|-------------|
 | currency_pair | VARCHAR | e.g., 'USD/INR', 'EUR/USD' |
-| trading_date | DATE | Prediction date |
+| date_time | DATETIME | Prediction date (**not** `trading_date` — that column name belongs to `forex_hist_data`) |
 | predicted_signal | VARCHAR | **'BUY', 'SELL', or 'HOLD'** — HOLD means the gate ABSTAINED (below threshold / vetoed), not a predicted class |
 | signal_confidence | FLOAT | Max class probability (kept even when abstaining, so a 0.60 abstain is distinguishable from a 0.51 one) |
 | prob_buy | FLOAT | P(BUY) = P(UP) from model |
@@ -175,6 +239,9 @@ sqlserver_copilot_forex/
 | prob_hold | FLOAT | Always 0.0 under the binary model (even for HOLD/abstain rows) |
 | model_name | VARCHAR | `daily_automation_model` (daily run) |
 | model_version | VARCHAR | `5.2_binary_rates` (current; daily rows carry a `+gated` suffix when the artifact predates the gate) |
+| actual_return_1d / _5d / _10d | FLOAT | Realised forward return, backfilled after the fact |
+| direction_correct_1d / _5d | BIT | Outcome flag — **auto-`True` for HOLD rows**, see §3.1(d) |
+| prediction_accuracy | VARCHAR | 'Correct'/'Incorrect', same HOLD caveat |
 
 ### Currency Pairs (actual, from `forex_hist_data`)
 > Pair discovery is live (`get_forex_pairs()` = `SELECT DISTINCT symbol FROM
@@ -184,9 +251,15 @@ sqlserver_copilot_forex/
 > and the model was retrained the same day (WF 0.655, best model `xgboost`,
 > stability PASSED).
 
-**15 active pairs:** EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/JPY, EUR/JPY,
-EUR/CHF, USD/HKD, USD/SGD, USD/INR, AUD/NZD, EUR/GBP, GBP/JPY, USD/CAD,
-USD/CHF. All train into the single global model.
+**14 live pairs:** EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/JPY, EUR/JPY,
+EUR/CHF, USD/HKD, USD/SGD, AUD/NZD, EUR/GBP, GBP/JPY, USD/CAD, USD/CHF.
+All train into the single global model.
+
+**USD/INR is a 15th pair in the DB but is NOT live** — its `forex_hist_data`
+stops at **2026-05-14** (upstream ingestion broken in the `stockanalysis` repo),
+so the freshness gate skips it every day. It is still picked up by
+`get_forex_pairs()` and **still contributes its stale rows to training**. Restore
+ingestion or exclude it explicitly before reading anything into USD/INR output.
 
 > The cluster grouping below is **no longer used for modeling** (per-cluster
 > models were rolled back). It remains in `src/forex_config.py` only as reference /
@@ -251,6 +324,12 @@ USD/CHF. All train into the single global model.
   feature on the predict side only
 - **Per-pair freshness gate**: pairs with `forex_hist_data` older than 1 business
   day are skipped with `[ERROR]` + a run-summary entry (never predicted on)
+- **Scoring rule**: when measuring accuracy, ALWAYS (a) filter
+  `predicted_signal <> 'HOLD'` — HOLD is auto-scored correct upstream, and
+  (b) filter to a single `model_version` — pooling across versions mixes the
+  pre- and post-leakage-fix eras and produces meaningless numbers, and
+  (c) compare against the realised up-rate on the same rows, never against 0.50.
+  `scripts/audit_live_performance.py` does all three.
 
 ### ⚠️ Critical: row order before feature engineering (look-ahead leakage)
 `ForexSQLServerConnection.get_forex_data_with_indicators` returns rows
@@ -270,7 +349,13 @@ python scripts/check_train_serve_parity.py EURUSD   # train vs serve feature par
 python train_enhanced_model.py                      # production retrain (expect WF ~0.55-0.65; >0.70 = leakage)
 python daily_forex_automation.py --run-now          # full daily run (freshness gate + signal gate + export)
 python scripts/compare_rates_features.py            # A/B before enabling/disabling rates features
+python scripts/audit_live_performance.py           # LIVE accuracy vs base rate + confidence inversion
 ```
+
+> `audit_live_performance.py` is the check that matters after a retrain —
+> walk-forward has consistently overstated live performance by ~10 pts. Run it
+> ~2 weeks after any model change, once enough rows have been scored, and
+> compare `edge_1d` / `edge_5d` (not raw accuracy) against the previous run.
 
 ---
 
@@ -281,6 +366,24 @@ python scripts/compare_rates_features.py            # A/B before enabling/disabl
   conviction or technical veto), not a model prediction; `prob_hold` is always
   0.0. Consumers should treat HOLD as "no actionable signal today".
 - Note: Forex is **excluded from Strategy 2 cross-analysis** (regression model underperformance)
+
+### ⚠️ Contract notes for consumers (added 2026-09-04, see §3.1)
+1. **`signal_confidence` must not be used as a quality/sizing input.** It is
+   anti-correlated with live accuracy (0.55–0.60 → 57.4%; 0.70+ → 40.0%).
+   A tier gate keyed to *higher* confidence selects the worse signals.
+2. **A ≥ 0.80 confidence gate is unreachable.** No v5.2 signal has exceeded
+   0.783. Historical ≥ 0.80 rows are pre-leakage-fix v3.0/v4.0 artifacts.
+   The correct response is to stop gating on confidence, not to lower the bar.
+3. **Do not compute accuracy over pooled `model_version`s**, and do not include
+   HOLD rows — both inflate the result (see §3.1(d)).
+4. **1-day direction has no live edge** (0.534 vs a 0.548 base rate). Consumers
+   presenting these as actionable 1-day calls are overstating them. The 5-day
+   column carries what edge exists.
+5. **Rolling-window accuracy needs n ≥ 5** before it is displayed — at ~1–2 BUY
+   signals per pair per week, a 7-day per-pair window is usually n=1–2.
+6. **`forex_cluster_*` v4.0 rows are dead** (30 rows, 2026-06-23–25, rolled back
+   for train/serve skew; they scored 12–14%). Consumers must filter to
+   `model_name='daily_automation_model'` — they are not a live model family.
 
 ---
 
