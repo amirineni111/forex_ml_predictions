@@ -534,6 +534,7 @@ class EnhancedForexTrainer:
                     'cv_accuracy': cv_accuracy,
                     'train_accuracy': train_accuracy,
                     'overfit_gap': overfit_gap,
+                    'ece': self._calibration_error(model, X_test_scaled, y_test),
                     'classification_report': classification_report(
                         y_test, y_pred, 
                         target_names=label_encoder.classes_,
@@ -547,8 +548,10 @@ class EnhancedForexTrainer:
                 elif test_accuracy > 0.55:
                     status = "[GOOD]"
                 
+                ece = test_results[model_name]['ece']
+                ece_txt = f", ECE={ece:.4f}" if ece is not None else ""
                 safe_print(f"  {model_name}: Test={test_accuracy:.4f}, CV={cv_accuracy:.4f}, "
-                          f"Train={train_accuracy:.4f}, Gap={overfit_gap:.3f} {status}")
+                          f"Train={train_accuracy:.4f}, Gap={overfit_gap:.3f}{ece_txt} {status}")
                 
             except Exception as e:
                 safe_print(f"  [ERROR] evaluating {model_name}: {e}")
@@ -556,6 +559,34 @@ class EnhancedForexTrainer:
         
         return test_results
     
+    @staticmethod
+    def _calibration_error(model, X_test, y_test, n_bins: int = 10):
+        """Expected Calibration Error on the held-out test set.
+
+        Mean |confidence - accuracy| across equal-width confidence bins. Low ECE
+        means a 0.80 signal is right about 80% of the time; high ECE means the
+        probability scale is inflated, which changes signal volume and misfires
+        downstream confidence gates even when accuracy is unchanged.
+        Returns None if the model cannot produce probabilities.
+        """
+        if not hasattr(model, 'predict_proba'):
+            return None
+        try:
+            proba = model.predict_proba(X_test)
+            conf = proba.max(axis=1)
+            pred = np.asarray(model.classes_)[proba.argmax(axis=1)]
+            correct = (pred == np.asarray(y_test)).astype(float)
+            edges = np.linspace(0.0, 1.0, n_bins + 1)
+            ece, n = 0.0, len(conf)
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                m = (conf > lo) & (conf <= hi)
+                if m.sum() == 0:
+                    continue
+                ece += (m.sum() / n) * abs(correct[m].mean() - conf[m].mean())
+            return float(ece)
+        except Exception:
+            return None
+
     def _select_best_model(self, results: dict, test_results: dict, wf_results: dict) -> str:
         """
         Select best model with anti-overfitting criteria.
@@ -602,11 +633,38 @@ class EnhancedForexTrainer:
             return None
         
         best = max(candidates, key=candidates.get)
-        safe_print(f"\n[MODEL SELECTION] Adjusted scores:")
+
+        # Calibration tie-break. Accuracy differences inside the noise band are
+        # not real, but the probability SCALE difference between candidates is:
+        # an inflated model of equal accuracy fires more signals and re-arms
+        # downstream confidence gates on the least accurate ones (CLAUDE.md 3.1e).
+        band = getattr(forex_config, 'MODEL_SELECTION_NOISE_BAND', 0.02)
+        top = candidates[best]
+        tied = {n: c for n, c in candidates.items() if top - c <= band}
+        calibrated = {n: test_results[n]['ece'] for n in tied
+                      if test_results.get(n, {}).get('ece') is not None}
+
+        safe_print("\n[MODEL SELECTION] Adjusted scores:")
         for name, score in sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:5]:
-            marker = " <-- BEST" if name == best else ""
-            safe_print(f"  {name}: {score:.4f}{marker}")
-        
+            ece = test_results.get(name, {}).get('ece')
+            ece_txt = f"  ECE={ece:.4f}" if ece is not None else ""
+            safe_print(f"  {name}: {score:.4f}{ece_txt}")
+
+        if len(calibrated) > 1:
+            by_ece = min(calibrated, key=calibrated.get)
+            if by_ece != best:
+                safe_print(f"\n[MODEL SELECTION] {len(tied)} candidates within the "
+                           f"{band:.2f} noise band of {best} ({top:.4f}):")
+                safe_print(f"  top score : {best} (score {candidates[best]:.4f}, "
+                           f"ECE {calibrated.get(best, float('nan')):.4f})")
+                safe_print(f"  selected  : {by_ece} (score {candidates[by_ece]:.4f}, "
+                           f"ECE {calibrated[by_ece]:.4f})  <-- better calibrated")
+                best = by_ece
+            else:
+                safe_print(f"\n[MODEL SELECTION] {best} is both top-scoring and "
+                           f"best-calibrated (ECE {calibrated[best]:.4f})")
+
+        safe_print(f"[MODEL SELECTION] --> {best}")
         return best
     
     def _check_model_stability(self, results, test_results, wf_results, best_model_name) -> bool:

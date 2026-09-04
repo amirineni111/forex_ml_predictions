@@ -111,6 +111,7 @@ sqlserver_copilot_forex/
 > | `scripts/compare_rates_features.py` | A/B gate: trains with/without rates features, saves the walk-forward winner |
 > | `scripts/check_train_serve_parity.py` | Regression guard: asserts train and predict pipelines produce identical model features |
 > | `scripts/audit_live_performance.py` | Live accuracy audit from `forex_ml_predictions`: BUY edge vs always-long base rate, confidence-bucket inversion, signal mix. Enforces the §5 scoring rules |
+> | `scripts/check_probability_range.py` | Post-retrain guard: probability spread of the current artifact — is SELL still reachable, did the ≥ 0.80 share jump? (§3.1e) |
 > | `data/best_forex_model.joblib` | The single production model artifact (git-ignored — retrain to regenerate) |
 >
 > Removed in the 2026-06-25 rollback: `src/features/relative_features.py` and the
@@ -151,13 +152,21 @@ sqlserver_copilot_forex/
   + market-context + `rate_*` differentials, with ~30 selected for the model
   after variance/missingness filtering + multi-method selection. Cross-pair
   "relative" features were removed in the rollback.
-- **Backtest performance (current artifact, 2026-08-30 retrain):** best model
-  `voting_soft`, walk-forward 0.6272 (std 0.0179, 5 windows) / CV 0.6093 /
-  overfit gap 0.089. Runner-up candidates were within noise (logistic_l2 WF
-  0.6285, xgboost WF 0.6282). Read these from the artifact
+- **Backtest performance (current artifact, 2026-09-04 retrain):** best model
+  `xgboost`, walk-forward 0.6309 (std 0.0249) / test 0.6276 / CV 0.6200 /
+  overfit gap 0.134, stability PASSED. Read these from the artifact
   (`walk_forward_results` / `training_results` in `data/best_forex_model.joblib`),
   not from this file — it goes stale every Sunday retrain.
-  (History: 2026-07-06 retrain WF 0.655 `xgboost`; 2026-07-04 WF 0.626.)
+  (History: 2026-08-30 WF 0.6272 `voting_soft`; 2026-07-06 WF 0.655 `xgboost`;
+  2026-07-04 WF 0.626.)
+  > **⚠️ Feature selection is unstable across retrains.** The 2026-09-04 retrain
+  > replaced **11 of 30** selected features vs 2026-08-30, five days earlier on
+  > nearly identical data — including dropping BOTH `rate_*` features that the
+  > 2026-07-04 A/B gate was run to justify. Backtest scores barely moved
+  > (WF 0.627 → 0.631), so the selector is choosing between near-equivalent
+  > correlated features rather than finding signal. Treat WF differences under
+  > ~0.02 between candidate models or retrains as noise, and do not read the
+  > selected-feature list as evidence about what drives the market.
 - **⚠️ LIVE performance does NOT match backtest — see §3.1 below.** Walk-forward
   0.63 has not reproduced out-of-sample: live BUY accuracy is 0.534 against a
   0.548 always-long base rate, i.e. **no measurable 1-day edge**.
@@ -197,11 +206,21 @@ Monotone decline across the whole live range. Any downstream tier/sizing logic
 that favours *higher* confidence is selecting the worse half of the book.
 Do not "fix" this by lowering a confidence gate to make it reachable.
 
-**(c) No v5.2 signal has ever reached 0.80 confidence** (max BUY = 0.783, max
-SELL = 0.719). The ≥ 0.80 signals in the table are all from the **pre-leakage-fix**
-v3.0/v4.0 era (max 0.993) and are not comparable. v5.2's compressed confidence is
-the honest one — the 0.99s were the bug. A downstream tier gate requiring ≥ 0.80
-is unreachable by construction.
+**(c) The 0.80 confidence ceiling was an artifact of model choice — and it is
+now gone.** Through 2026-09-04 no live v5.2 signal had ever reached 0.80 (max BUY
+0.783, max SELL 0.719), which made downstream ≥ 0.80 tier gates dead by
+construction. That ceiling belonged to the `voting_soft` artifact, not to the
+model family: the `xgboost` artifact deployed 2026-09-04 clears 0.80 on **~20% of
+firing signals**. The pre-leakage-fix v3.0/v4.0 rows (max 0.993) remain a
+separate, non-comparable era.
+
+> ⚠️ **Downstream gates that were safely dormant are now live.** Any consumer
+> logic keyed to ≥ 0.80 confidence started firing with this artifact. It must
+> stay disabled until §3.1(b)'s inversion is re-measured on LIVE rows from this
+> artifact (`scripts/audit_live_performance.py`, ~2–4 weeks of scored rows).
+> The inversion was measured on older, compressed artifacts; whether it holds for
+> a better-calibrated model is an open question, and a test-split ECE of 0.021
+> is not an answer to it.
 
 **(d) ⚠️ HOLD rows are effectively auto-correct.** The upstream scoring job
 (`backfill_strategy1_outcomes.py`, in the `STREAMLIT_TRADING_DASHBOARD` repo)
@@ -212,6 +231,42 @@ scores 0.976 across 422 rows and the flag carries almost no information.
 the model abstained. Always filter `predicted_signal <> 'HOLD'` when scoring.
 The proper upstream fix is an FX-scaled band (≈ 0.25%, or ATR-relative per pair),
 not the equity 1%.
+
+**(e) ⚠️ Model choice rescales confidence — but "narrower" is NOT "better".**
+Candidates sit within noise of each other on walk-forward yet produce very
+different probability spreads, which changes signal VOLUME and re-arms downstream
+confidence gates. Measured on identical data (last 60 bars × 15 pairs):
+
+| artifact | WF | p90 prob | fires SELL | ≥ 0.80 conf | **test ECE** |
+|---|---|---|---|---|---|
+| `voting_soft` (2026-08-30) | 0.627 | 0.62–0.63 | 10.1% | 6.5% | **0.0433** |
+| `xgboost` (2026-09-04) | 0.635 | 0.70–0.72 | 15.2% | 20.3% | **0.0206** |
+
+**The intuitive reading of this table is wrong.** Soft-voting averages its
+members and compresses probabilities, so it *looks* conservative — but by
+Expected Calibration Error it is the WORSE of the two: it says 0.58 when it is
+right 64% of the time. Under-confidence is a calibration error just as
+over-confidence is. Do not infer calibration from probability spread; measure it.
+
+**What this does and does not settle:** ECE here is computed on the held-out test
+split, and test-split metrics in this repo have a track record of not reproducing
+live (WF 0.63 → live 0.53, §3.1a). So a low test ECE is a reason to prefer a
+model, not proof its 0.80 signals are right 80% of the time live. Until
+`scripts/audit_live_performance.py` shows a positive confidence/accuracy slope on
+LIVE rows, downstream confidence gates should stay off regardless of which
+artifact is deployed.
+
+**Mitigation (2026-09-04):** `_select_best_model` now applies a **calibration
+tie-break** — candidates within `forex_config.MODEL_SELECTION_NOISE_BAND` (0.02)
+of the top composite score are re-ranked by test-set ECE, best-calibrated wins,
+and the override is logged. ECE is reported per candidate during training.
+Run `scripts/check_probability_range.py` after each retrain and before the next
+daily run to confirm (i) SELL is reachable at its threshold and (ii) you know
+what the ≥ 0.80 share is.
+
+**Run-to-run variance:** two retrains on identical config and data the same day
+gave WF 0.6309 and 0.6348 for the same model. Run-to-run noise (~0.01 WF) exceeds
+most between-model differences. One retrain's numbers are not a measurement.
 
 ### Feature Categories (100+)
 | Category | Examples |
@@ -239,9 +294,24 @@ not the equity 1%.
 | prob_hold | FLOAT | Always 0.0 under the binary model (even for HOLD/abstain rows) |
 | model_name | VARCHAR | `daily_automation_model` (daily run) |
 | model_version | VARCHAR | `5.2_binary_rates` (current; daily rows carry a `+gated` suffix when the artifact predates the gate) |
-| actual_return_1d / _5d / _10d | FLOAT | Realised forward return, backfilled after the fact |
+| actual_return_1d / _5d / _10d | FLOAT | Realised forward return, backfilled after the fact. **Outcome columns, not predictions** — see the note below |
 | direction_correct_1d / _5d | BIT | Outcome flag — **auto-`True` for HOLD rows**, see §3.1(d) |
 | prediction_accuracy | VARCHAR | 'Correct'/'Incorrect', same HOLD caveat |
+
+> **⚠️ There is no 5-day prediction.** The `_5d` / `_10d` columns are
+> **retrospective outcomes** written by the upstream backfill job; nothing in this
+> repo predicts a multi-day horizon. The model's only target is the sign of the
+> **1-day** forward return (`future_return_1d`). `future_return_3d` and
+> `future_return_5d` are computed in `train_enhanced_model.py` but appear solely
+> in the feature-exclusion list — they are never labels.
+>
+> So the "+9.4 pt 5-day edge" in §3.1(a) is **the same 1-day signal scored over a
+> longer window**, not the output of a 5-day model. It is knowable only in
+> retrospect and cannot be published as a signal. Realising it would require
+> re-labelling the target and retraining.
+>
+> `DEFAULT_PREDICTION_HORIZON=5` in `.env` is **dead config** — no code reads it.
+> Do not assume it controls anything.
 
 ### Currency Pairs (actual, from `forex_hist_data`)
 > Pair discovery is live (`get_forex_pairs()` = `SELECT DISTINCT symbol FROM
@@ -350,6 +420,7 @@ python train_enhanced_model.py                      # production retrain (expect
 python daily_forex_automation.py --run-now          # full daily run (freshness gate + signal gate + export)
 python scripts/compare_rates_features.py            # A/B before enabling/disabling rates features
 python scripts/audit_live_performance.py           # LIVE accuracy vs base rate + confidence inversion
+python scripts/check_probability_range.py          # post-retrain: SELL reachable? >=0.80 share stable?
 ```
 
 > `audit_live_performance.py` is the check that matters after a retrain —
@@ -371,9 +442,13 @@ python scripts/audit_live_performance.py           # LIVE accuracy vs base rate 
 1. **`signal_confidence` must not be used as a quality/sizing input.** It is
    anti-correlated with live accuracy (0.55–0.60 → 57.4%; 0.70+ → 40.0%).
    A tier gate keyed to *higher* confidence selects the worse signals.
-2. **A ≥ 0.80 confidence gate is unreachable.** No v5.2 signal has exceeded
-   0.783. Historical ≥ 0.80 rows are pre-leakage-fix v3.0/v4.0 artifacts.
-   The correct response is to stop gating on confidence, not to lower the bar.
+2. **≥ 0.80 confidence signals now exist again — do not treat that as a green
+   light.** The pre-2026-09-04 `voting_soft` artifact never exceeded 0.783, so
+   ≥ 0.80 gates were dormant; the `xgboost` artifact deployed 2026-09-04 clears
+   0.80 on ~20% of firing signals. Those gates must remain OFF until the
+   confidence/accuracy relationship is re-measured on live rows from this
+   artifact. Re-arming them on backtest calibration alone repeats the mistake
+   that produced §3.1(a).
 3. **Do not compute accuracy over pooled `model_version`s**, and do not include
    HOLD rows — both inflate the result (see §3.1(d)).
 4. **1-day direction has no live edge** (0.534 vs a 0.548 base rate). Consumers

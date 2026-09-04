@@ -41,6 +41,13 @@ DEFAULT_PAIRS: List[str] = [
 TRAINING_LOOKBACK_DAYS = 400   # binary model needs long history; 90d = regime bias
 USE_BINARY_DIRECTION = True    # 3-class BUY/HOLD/SELL has no edge (~41.5% WF vs 41% baseline)
 TRAINING_TEST_SIZE = 0.2
+
+# Walk-forward differences below this are noise, not signal. Within this band the
+# selector falls back to calibration (lowest ECE) instead of chasing decimals.
+# Set from the 2026-09-04 retrain: the top 3 candidates spanned 0.0032 WF, but the
+# winner (xgboost) tripled the share of >=0.80-confidence signals vs voting_soft,
+# re-arming downstream tier gates on the least accurate signals. See CLAUDE.md 3.1e.
+MODEL_SELECTION_NOISE_BAND = 0.02
 # Rate-differential features from forex_rates_daily. Accepted by
 # scripts/compare_rates_features.py on 2026-07-04 (WF 0.6256 vs 0.6241
 # baseline; rate_yield_10y_diff_chg_5d/_chg_20d survived feature selection).
