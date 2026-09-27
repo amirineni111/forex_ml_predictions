@@ -152,12 +152,18 @@ sqlserver_copilot_forex/
   + market-context + `rate_*` differentials, with ~30 selected for the model
   after variance/missingness filtering + multi-method selection. Cross-pair
   "relative" features were removed in the rollback.
-- **Backtest performance (current artifact, 2026-09-04 retrain):** best model
-  `xgboost`, walk-forward 0.6309 (std 0.0249) / test 0.6276 / CV 0.6200 /
-  overfit gap 0.134, stability PASSED. Read these from the artifact
+- **Backtest performance (current artifact, 2026-09-27 retrain, 14 pairs —
+  first without USD/INR and first with a working `stacking` candidate):** best
+  model `xgboost`, walk-forward 0.6330 / test 0.6218 / CV 0.6179 / overfit gap
+  0.139, ECE 0.011, stability PASSED. `stacking` scored top (0.6305 vs 0.6264)
+  but lost the §3.1(e) calibration tie-break (ECE 0.018).
+  > `stacking` failed on every retrain before 2026-09-27: its
+  > `cv=TimeSeriesSplit` is not a partition, which `cross_val_predict` rejects.
+  > It now uses unshuffled `KFold(3)` (meta-learner inputs only; walk-forward
+  > still scores the stack on future windows). Read these from the artifact
   (`walk_forward_results` / `training_results` in `data/best_forex_model.joblib`),
   not from this file — it goes stale every Sunday retrain.
-  (History: 2026-08-30 WF 0.6272 `voting_soft`; 2026-07-06 WF 0.655 `xgboost`;
+  (History: 2026-09-04 WF 0.6309 `xgboost`; 2026-08-30 WF 0.6272 `voting_soft`; 2026-07-06 WF 0.655 `xgboost`;
   2026-07-04 WF 0.626.)
   > **⚠️ Feature selection is unstable across retrains.** The 2026-09-04 retrain
   > replaced **11 of 30** selected features vs 2026-08-30, five days earlier on
@@ -325,11 +331,12 @@ most between-model differences. One retrain's numbers are not a measurement.
 EUR/CHF, USD/HKD, USD/SGD, AUD/NZD, EUR/GBP, GBP/JPY, USD/CAD, USD/CHF.
 All train into the single global model.
 
-**USD/INR is a 15th pair in the DB but is NOT live** — its `forex_hist_data`
-stops at **2026-05-14** (upstream ingestion broken in the `stockanalysis` repo),
-so the freshness gate skips it every day. It is still picked up by
-`get_forex_pairs()` and **still contributes its stale rows to training**. Restore
-ingestion or exclude it explicitly before reading anything into USD/INR output.
+**USD/INR is a 15th pair in the DB but is EXCLUDED** — its `forex_hist_data`
+stops at **2026-05-14** (no longer fetched upstream). Since 2026-09-27 it is
+listed in `forex_config.EXCLUDED_PAIRS`, which `get_forex_pairs()` filters out,
+so it is neither trained on nor predicted. (Retrains up to and including
+2026-09-27 12:30 PM still included its 180 stale rows.) To bring it back,
+restore ingestion and remove it from `EXCLUDED_PAIRS`.
 
 > The cluster grouping below is **no longer used for modeling** (per-cluster
 > models were rolled back). It remains in `src/forex_config.py` only as reference /

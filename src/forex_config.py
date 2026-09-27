@@ -24,9 +24,15 @@ from typing import Dict, List
 # ---------------------------------------------------------------------------
 DEFAULT_PAIRS: List[str] = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'NZDUSD',
-    'EURJPY', 'EURCHF', 'USDHKD', 'USDSGD', 'USDINR',
+    'EURJPY', 'EURCHF', 'USDHKD', 'USDSGD',
     'AUDNZD', 'EURGBP', 'GBPJPY', 'USDCAD', 'USDCHF',
 ]
+
+# Symbols present in forex_hist_data that must NOT be trained on or predicted.
+# get_forex_pairs() filters these out, so training, the daily run and the dev
+# scripts all skip them. USDINR is no longer ingested upstream (last row
+# 2026-05-14); its stale rows were leaking into every weekly retrain.
+EXCLUDED_PAIRS = frozenset({'USDINR'})
 
 # ---------------------------------------------------------------------------
 # Production training configuration (single source of truth).

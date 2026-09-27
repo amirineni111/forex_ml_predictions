@@ -17,7 +17,7 @@ from sklearn.ensemble import (
     ExtraTreesClassifier, RandomForestClassifier,
     GradientBoostingClassifier
 )
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
@@ -196,12 +196,17 @@ class AdvancedForexModels:
                 voting='soft'
             )
         
-        # Stacking with LogisticRegression meta-learner
+        # Stacking with LogisticRegression meta-learner.
+        # cv must be a full partition: StackingClassifier uses cross_val_predict,
+        # which rejects TimeSeriesSplit (its first block is never a test fold), so
+        # stacking failed on every retrain. Contiguous unshuffled folds only affect
+        # how the meta-learner's inputs are built; walk-forward still scores the
+        # whole stack strictly on future windows.
         if len(base_models) >= 2:
             ensemble_models['stacking'] = StackingClassifier(
                 estimators=base_models,
                 final_estimator=LogisticRegression(C=0.5, random_state=42, max_iter=1000),
-                cv=TimeSeriesSplit(n_splits=3),
+                cv=KFold(n_splits=3, shuffle=False),
                 passthrough=False
             )
         

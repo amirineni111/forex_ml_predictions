@@ -141,11 +141,16 @@ class ForexSQLServerConnection:
     
     def get_forex_pairs(self) -> List[str]:
         """
-        Get list of available forex pairs from the database.
-        
+        Get list of available forex pairs from the database, minus
+        forex_config.EXCLUDED_PAIRS (symbols with retired ingestion).
+
         Returns:
             List of forex pair symbols
         """
+        try:
+            from forex_config import EXCLUDED_PAIRS
+        except ImportError:
+            from src.forex_config import EXCLUDED_PAIRS
         query = """
         SELECT DISTINCT symbol as currency_pair 
         FROM forex_hist_data
@@ -155,7 +160,7 @@ class ForexSQLServerConnection:
         
         try:
             df = pd.read_sql(query, self.get_sqlalchemy_engine())
-            return df['currency_pair'].tolist()
+            return [p for p in df['currency_pair'].tolist() if p not in EXCLUDED_PAIRS]
         except Exception as e:
             logger.error(f"Error fetching forex pairs: {e}")
             return []
