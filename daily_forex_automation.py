@@ -255,6 +255,10 @@ class ForexDailyAutomation:
         
         Queries ai_prediction_history to see recent direction accuracy.
         Returns drift status and recommendations.
+
+        NOTE: ai_prediction_history belongs to a separate (stopped) process, so
+        this does NOT measure this repo's model. Manual `--check-drift` only;
+        no longer called by the daily run. Use scripts/audit_live_performance.py.
         """
         safe_print("[CHECK] Checking model drift...")
         
@@ -356,13 +360,12 @@ class ForexDailyAutomation:
             if not self.check_data_freshness():
                 safe_print("[WARN] Proceeding with available data...")
             
-            # Step 2: Check model drift - may trigger retraining
-            drift_report = self.check_model_drift()
-            
-            if drift_report['should_retrain']:
-                safe_print("[INFO] Drift detected - retraining model before predictions...")
-                self.retrain_models_weekly()
-            
+            # Step 2 (drift-triggered retrain) removed 2026-09-29: check_model_drift()
+            # reads ai_prediction_history, a separate (stopped) process's models,
+            # not this model's forex_ml_predictions. Retrains run only on the
+            # Sunday schedule; measure live performance with
+            # scripts/audit_live_performance.py.
+
             # Step 3: Drop previous prediction tables to start fresh
             self.drop_previous_prediction_tables()
             
